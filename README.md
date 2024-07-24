@@ -4,8 +4,8 @@ This repository contains a collection of samples, best practices and reference a
 
 ## Contents
 
-* [RDS Data API Row-level Security]
-* Multi-tenant vector databases
+* [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
+* [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 
 ## RDS Data API Row-level Security
 
