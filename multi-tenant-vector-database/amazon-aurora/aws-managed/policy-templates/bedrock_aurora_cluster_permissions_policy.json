@@ -1,0 +1,26 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "RdsDescribeStatementID",
+            "Effect": "Allow",
+            "Action": [
+                "rds:DescribeDBClusters"
+            ],
+            "Resource": [
+                "#rds_aurora_cluster_arn#"
+            ]
+        },
+        {
+            "Sid": "DataAPIStatementID",
+            "Effect": "Allow",
+            "Action": [
+                "rds-data:BatchExecuteStatement",
+                "rds-data:ExecuteStatement"
+            ],
+            "Resource": [
+                "#rds_aurora_cluster_arn#"
+            ]
+        }
+    ]
+}
