@@ -1,6 +1,6 @@
 # AWS Data for SaaS
 
-This repository contains a collection of samples, best practices and reference architectures for implementing SaaS applications on AWS for databases and data services. 
+This repository contains a collection of samples, best practices and reference architectures for implementing SaaS applications on AWS for databases and data services.
 
 ## Contents
 
@@ -9,7 +9,7 @@ This repository contains a collection of samples, best practices and reference a
 
 ## RDS Data API Row-level Security
 
-Row-level security is commonly employed in multi-tenant databases to provide isolation between tenant's data. Row level security policies are created in the database to enforce this isolation on tenant-owned tables. 
+Row-level security is commonly employed in multi-tenant databases to provide isolation between tenant's data. Row level security policies are created in the database to enforce this isolation on tenant-owned tables.
 
 This sample contains 2 examples for implementing row-level security using the [RDS data API for Amazon Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.html). The examples provided are in Python, but they can be easily transferred to other languages using the same patterns. Additionally, these examples will work for Amazon Aurora PostgreSQL provisioned or serverless V2.
 
@@ -21,9 +21,13 @@ This sample contains 2 examples for implementing row-level security using the [R
 
 ### Amazon Aurora
 
-Vector databases are commonly employed to store embeddings generated as part of generative-AI applications. A popular option is to use the pg_vector extension for PostgreSQL. 
+Vector databases are commonly employed to store embeddings generated as part of generative-AI applications. A popular option is to use the pgvector extension for PostgreSQL. Amazon Aurora PostgreSQL supports the pgvector extension to store embeddings from machine learning (ML) models in your database and to perform efficient similarity searches.
 
-This sample shows how to use pg_vector in a multi-tenant database, enforcing tenant isolation. One example is using a self-managed Retrieval-augmented generation (RAG) implementation, the other is using [Amazon Bedrock knowledge bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html). 
+You can use an existing Aurora PostgreSQL cluster or use the CDK code to provision an Aurora PostgreSQL cluster that is a prerequisite for running the sample.
+
+[Deploy Aurora PostgreSQL using CDK](multi-tenant-vector-database/amazon-aurora/cdk/README.md)
+
+This sample shows how to use pgvector in a multi-tenant database, enforcing tenant isolation. One example is using a self-managed Retrieval-augmented generation (RAG) implementation, the other is using [Amazon Bedrock knowledge bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html).
 
 [Example 1 - Self-managed](multi-tenant-vector-database/amazon-aurora/self-managed/)
 
