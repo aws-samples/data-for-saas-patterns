@@ -8,6 +8,7 @@ This repository contains a collection of samples, best practices and reference a
 * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs)
+* [Videos](README.md#videos)
 
 ## RDS Data API Row-level Security
 
@@ -35,7 +36,7 @@ This sample shows how to use pgvector in a multi-tenant database, enforcing tena
 
 [Example 2 - AWS-managed](multi-tenant-vector-database/amazon-aurora/aws-managed/)
 
-## Data for SaaS Blogs
+## Data for SaaS Blogs :books:
 
 Below is a collection of published blog posts covering different aspects of building data architectures for SaaS applications on AWS:
 
@@ -62,6 +63,10 @@ This blog post explains how to use Amazon Aurora PostgreSQL and Amazon EventBrid
 ### [Enforce row-level security with the RDS Data API](https://aws.amazon.com/blogs/database/enforce-row-level-security-with-the-rds-data-api/)
 
 This blog post discusses how to enforce row-level security in Amazon Aurora PostgreSQL-Compatible Edition using the RDS Data API and PostgreSQL features. It provides an overview of row-level security policies in PostgreSQL and demonstrates how to create a shared tenant schema, define a row-level security policy, and test the tenant isolation using both traditional connection management and the RDS Data API. The post highlights the benefits of using the RDS Data API for securely querying filtered data without managing database connections or connection pools. It also covers cost considerations, metering strategies, and cleanup steps. Overall, the post aims to help readers build secure and scalable multi-tenant PostgreSQL architectures on AWS.
+
+### Videos :movie_camera:
+
+[ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
 
 ## Security
 
