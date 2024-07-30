@@ -1,16 +1,17 @@
 import * as cdk from 'aws-cdk-lib';
 import { Construct } from 'constructs';
-import { aws_secretsmanager as sm, CfnDynamicReference, CfnDynamicReferenceService } from 'aws-cdk-lib'
+import { Duration } from 'aws-cdk-lib'
 import { SubnetType, Vpc, SecurityGroup, IpAddresses } from 'aws-cdk-lib/aws-ec2';
-import { AuroraCapacityUnit, CfnDBCluster, CfnDBInstance, CfnDBSubnetGroup } from 'aws-cdk-lib/aws-rds';
-
+import { FlowLogMaxAggregationInterval, FlowLogTrafficType } from 'aws-cdk-lib/aws-ec2';
+import { AuroraCapacityUnit, CfnDBSubnetGroup } from 'aws-cdk-lib/aws-rds';
+import { DatabaseCluster, DatabaseClusterEngine, AuroraPostgresEngineVersion, ClusterInstance } from 'aws-cdk-lib/aws-rds';
 export class AuroraCdkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
     const databasename = 'postgres';
 
-    // VPC 
+    // VPC
     const vpc = new Vpc(this, 'Vpc', {
       ipAddresses: IpAddresses.cidr('10.0.0.0/16'),
       natGateways: 0,
@@ -28,7 +29,12 @@ export class AuroraCdkStack extends cdk.Stack {
       ]
     });
 
-    // Security group 
+    vpc.addFlowLog('FlowLogCloudWatch', {
+      trafficType: FlowLogTrafficType.REJECT,
+      maxAggregationInterval: FlowLogMaxAggregationInterval.ONE_MINUTE,
+    });
+
+    // Security group
     const dbSecurityGroup: SecurityGroup = new SecurityGroup(this, 'db-security-group', {
       securityGroupName: 'db-security-group',
       description: 'db-security-group',
@@ -46,54 +52,35 @@ export class AuroraCdkStack extends cdk.Stack {
       subnetIds
     });
 
-    // Secret Manager
-    const secret = new sm.CfnSecret(this, "AuroraGlobalServerlessDBSecret", {
-      name: `aurora-serverless-global-db-secret`,
-      generateSecretString: {
-        secretStringTemplate: JSON.stringify({ username: 'postgres' }),
-        excludePunctuation: true,
-        includeSpace: false,
-        generateStringKey: "password",
-      },
-    });
+    const dbCluster = new DatabaseCluster(this, 'DbCluster', {
+      engine: DatabaseClusterEngine.auroraPostgres({
+        version: AuroraPostgresEngineVersion.VER_16_2,
+      }),
+      iamAuthentication: true,
+      storageEncrypted: true,
+      deletionProtection: true,
+      writer: ClusterInstance.serverlessV2('writer', {
+      }),
+      vpc: vpc,
+      securityGroups: [dbSecurityGroup],
+      vpcSubnets: vpc.selectSubnets({
+        subnetType: SubnetType.PRIVATE_ISOLATED,
+      }),
+      serverlessV2MaxCapacity: AuroraCapacityUnit.ACU_4,
+      serverlessV2MinCapacity: AuroraCapacityUnit.ACU_2,
+      port: 5432, // use port 5432 instead of 3306
+      enableDataApi: true
+    })
 
-    // Aurora DB Cluster
-    const cfndbclusterprops = {
-      dbClusterIdentifier: id,
-      dbSubnetGroupName: dbSubnetGroup.dbSubnetGroupName,
-      engine: 'aurora-postgresql',
-      engineVersion: '16.2',
-      databaseName: databasename,
-      masterUsername: new CfnDynamicReference(CfnDynamicReferenceService.SECRETS_MANAGER, 'aurora-serverless-global-db-secret:SecretString:username').toString(),
-      masterUserPassword: new CfnDynamicReference(CfnDynamicReferenceService.SECRETS_MANAGER, 'aurora-serverless-global-db-secret:SecretString:password').toString(),
-      serverlessV2ScalingConfiguration: {
-        maxCapacity: AuroraCapacityUnit.ACU_4,
-        minCapacity: AuroraCapacityUnit.ACU_2,
-      },
-      vpcSecurityGroupIds: [dbSecurityGroup.securityGroupId],
-      enableHttpEndpoint: true
-    };
+    dbCluster.addRotationSingleUser({
+      automaticallyAfter: Duration.days(30),
+      excludeCharacters: ' %\'@',
+      vpcSubnets: vpc.selectSubnets({
+        subnetType: SubnetType.PRIVATE_ISOLATED,
+      }),
+    })
 
-    const dbcluster = new CfnDBCluster(this, "db-cluster", cfndbclusterprops);
-    dbcluster.addDependency(dbSubnetGroup);
-    dbcluster.addDependency(secret);
-
-
-    // Aurora Serverless DB Instance
-    const cfndbinstanceprops = {
-      dbClusterIdentifier: dbcluster.dbClusterIdentifier,
-      dbInstanceClass: 'db.serverless',
-      dbInstanceIdentifier: 'serverless-db-instance',
-      engine: 'aurora-postgresql',
-      engineVersion: '16.2',
-    };
-
-    const dbinstance = new CfnDBInstance(this, "serverless-db-instance", cfndbinstanceprops);
-
-    dbinstance.addDependency(dbcluster);
-
-    new cdk.CfnOutput(this, 'Aurora Cluster ARN', { value: dbcluster.attrDbClusterArn });
-    new cdk.CfnOutput(this, 'Aurora Cluster Secret ARN ', { value: secret.attrId });
+    new cdk.CfnOutput(this, 'Aurora Cluster ARN', { value: dbCluster.clusterArn });
 
   }
 }
