@@ -7,8 +7,8 @@ This repository contains a collection of samples, best practices and reference a
 * [Reference Architectures](./reference-architectures/)
 * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
-* [Data for SaaS blogs](README.md#data-for-saas-blogs)
-* [Videos](README.md#videos)
+* [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
+* [Videos](README.md#videos-movie_camera)
 
 ## RDS Data API Row-level Security
 
