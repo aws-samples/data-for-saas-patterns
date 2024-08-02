@@ -5,8 +5,10 @@ This repository contains a collection of samples, best practices and reference a
 ## Contents
 
 * [Reference Architectures](./reference-architectures/)
-* [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
-* [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
+* [Samples](./samples/)
+* * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
+* * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
+* * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduling-autoscaling-aurora-serverless-v2)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
 * [Videos](README.md#videos-movie_camera)
 
@@ -16,9 +18,9 @@ Row-level security is commonly employed in multi-tenant databases to provide iso
 
 This sample contains 2 examples for implementing row-level security using the [RDS data API for Amazon Aurora](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.html). The examples provided are in Python, but they can be easily transferred to other languages using the same patterns. Additionally, these examples will work for Amazon Aurora PostgreSQL provisioned or serverless V2.
 
-[Example 1 - RLS with PostgreSQL function](rds-data-api-rls/rds-data-api-rls-function.ipynb)
+[Example 1 - RLS with PostgreSQL function](./samples/rds-data-api-rls/rds-data-api-rls-function.ipynb)
 
-[Example 2 - RLS with database transactions](rds-data-api-rls/rds-data-api-rls-transaction.ipynb)
+[Example 2 - RLS with database transactions](./samples/rds-data-api-rls/rds-data-api-rls-transaction.ipynb)
 
 ## Multi-tenant vector databases
 
@@ -28,13 +30,19 @@ Vector databases are commonly employed to store embeddings generated as part of 
 
 You can use an existing Aurora PostgreSQL cluster or use the CDK code to provision an Aurora PostgreSQL cluster that is a prerequisite for running the sample.
 
-[Deploy Aurora PostgreSQL using CDK](multi-tenant-vector-database/amazon-aurora/cdk/README.md)
+[Deploy Aurora PostgreSQL using CDK](./samples/multi-tenant-vector-database/amazon-aurora/cdk/README.md)
 
 This sample shows how to use pgvector in a multi-tenant database, enforcing tenant isolation. One example is using a self-managed Retrieval-augmented generation (RAG) implementation, the other is using [Amazon Bedrock knowledge bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html).
 
-[Example 1 - Self-managed](multi-tenant-vector-database/amazon-aurora/self-managed/)
+[Example 1 - Self-managed](./samples/multi-tenant-vector-database/amazon-aurora/self-managed/)
 
-[Example 2 - AWS-managed](multi-tenant-vector-database/amazon-aurora/aws-managed/)
+[Example 2 - AWS-managed](./samples/multi-tenant-vector-database/amazon-aurora/aws-managed/)
+
+## Scheduled Autoscaling Aurora Serverless V2
+
+This sample provides a CDK application that creates a scheduled job to scale up and down an Aurora Serverless V2 instance minimum capacity. This is useful for SaaS applications with predictable usage patterns to reduce scaling times during busy periods. 
+
+[Scheduled Autoscaling Aurora Serverless V2](./samples/scheduled-aurora-serverless-scaling/)
 
 ## Data for SaaS Blogs :books:
 
