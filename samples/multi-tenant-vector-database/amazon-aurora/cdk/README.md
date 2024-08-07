@@ -19,7 +19,7 @@ Amazon Aurora PostgreSQL is one of the prerequisite for running the sample noteb
     ```
 2. Change directory to the cdk project :
     ```
-    cd data-for-saas-patterns/multi-tenant-vector-database/amazon-aurora/cdk
+    cd data-for-saas-patterns/samples/multi-tenant-vector-database/amazon-aurora/cdk
     ```
 3. Install dependencies:
     ```

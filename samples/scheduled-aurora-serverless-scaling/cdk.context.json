@@ -1,0 +1,9 @@
+{
+    "scheduleUp": "cron(0 8 * * ? *)",
+    "desiredCapacityUpMin": "8",
+    "desiredCapacityUpMax": "128",
+    "scheduleDown": "cron(0 18 * * ? *)",
+    "desiredCapacityDownMin": "0.5",
+    "desiredCapacityDownMax": "8",
+    "dbClusterId": "scalingtarget"
+}
