@@ -42,6 +42,8 @@ This sample does not create the Aurora Serverless V2 instance. You must already 
 
 The sample is implemented using the AWS Cloud Development Kit (CDK). It supports a single "scale up" and/or a single "scale down" schedule, but this is easily extensible by modifying the code. 
 
+Be sure to update the dbClusterId in the `cdk.context.json` file with your cluster ID. You can find this in the AWS management console. 
+
 To define your cron schedule to scale up and down and the min/max for each scaling action, edit the `cdk.context.json` file:
 
 ```json
@@ -52,7 +54,7 @@ To define your cron schedule to scale up and down and the min/max for each scali
     "scheduleDown": "cron(0 18 * * ? *)",
     "desiredCapacityDownMin": "0.5",
     "desiredCapacityDownMax": "8",
-    "dbClusterId": "scalingtarget"
+    "dbClusterId": "scalingtarget" //update to your cluster ID
 }
 ```
 
@@ -60,6 +62,23 @@ To deploy the solution:
 
 ```
 cdk deploy
+```
+
+To validate the solution is working, you can check the cluster's scaling configuration using the following AWS CLI command:
+
+```
+aws rds describe-db-clusters --db-cluster-identifier myClusterId --query 'DBClusters[].ServerlessV2ScalingConfiguration' --output table
+```
+
+Example output:
+```
+--------------------------------
+|      DescribeDBClusters      |
++--------------+---------------+
+|  MaxCapacity |  MinCapacity  |
++--------------+---------------+
+|  128.0       |  8.0          |
++--------------+---------------+
 ```
 
 To destroy the solution and remove all resources when you are done:

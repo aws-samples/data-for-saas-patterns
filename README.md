@@ -8,7 +8,7 @@ This repository contains a collection of samples, best practices and reference a
 * [Samples](./samples/)
 * * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
-* * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduling-autoscaling-aurora-serverless-v2)
+* * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
 * [Videos](README.md#videos-movie_camera)
 
