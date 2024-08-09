@@ -9,6 +9,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
+* * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
 * [Videos](README.md#videos-movie_camera)
 
@@ -43,6 +44,11 @@ This sample shows how to use pgvector in a multi-tenant database, enforcing tena
 This sample provides a CDK application that creates a scheduled job to scale up and down an Aurora Serverless V2 instance minimum capacity. This is useful for SaaS applications with predictable usage patterns to reduce scaling times during busy periods. 
 
 [Scheduled Autoscaling Aurora Serverless V2](./samples/scheduled-aurora-serverless-scaling/)
+
+## Aurora Global Database Serverless V2
+This sample provides a CDK application that creates Amazon Aurora Global database custer across a primary and secondary region for SaaS applications that need global footprint and for disaster recovery strategies. The stack also includes a Fargate container application to test the primary and secondary regions with CRUD API operations. 
+
+[Aurora Global Database Serverless V2](./samples/aurora-serverless-global-db-cdk/)
 
 ## Data for SaaS Blogs :books:
 
