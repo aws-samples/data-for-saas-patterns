@@ -32,7 +32,11 @@ Important: This sample uses various AWS services and there are costs associated 
     cdk bootstrap 111111111111/eu-west-1
     cdk bootstrap 111111111111/eu-west-2
     ```
-5. From the command line, use AWS CDK to deploy the all the stacks synthesized: 
+5. Configure ingressIpAddress context variable in the cdk.context.json. This ip address will be configured in the ingress SecurityGroup rule for the Fargate test app. 
+    ```
+    x.x.x.x/32
+    ```
+6. From the command line, use AWS CDK to deploy the all the stacks synthesized: 
     ```
     cdk deploy --all
     ```
@@ -87,7 +91,7 @@ Note down the primary-test-app.FargateServiceURL and secondary-test-app.FargateS
     ```
     Expected Response : error : cannot execute INSERT in a read-only transaction
     
-    Note : You can enable Write forwarding feature to continue to use the Secondary cluster endpoint for write transactions as well. 
+    Note : You can enable [Write forwarding](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/aurora-global-database-write-forwarding.html) feature in Amazon Aurora Global database to continue to use the Secondary cluster endpoint for write transactions as well. 
 
 5. You can also try to update and delete the task on the Primary cluster 
     ```

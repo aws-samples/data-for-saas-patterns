@@ -1,12 +1,3 @@
 {
-  "availability-zones:account=743736387305:region=eu-west-1": [
-    "eu-west-1a",
-    "eu-west-1b",
-    "eu-west-1c"
-  ],
-  "availability-zones:account=743736387305:region=eu-west-2": [
-    "eu-west-2a",
-    "eu-west-2b",
-    "eu-west-2c"
-  ]
+  "ingressIpAddress": "27.63.217.195/32"
 }

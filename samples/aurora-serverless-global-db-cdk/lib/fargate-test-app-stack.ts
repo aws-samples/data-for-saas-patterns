@@ -22,8 +22,10 @@ export class FargateTestAppStack extends Stack {
       appSecurityGroup, Port.tcp(1234), 'allow port 1234 from the appSecurityGroup'
     );
 
+    const ingressIp = this.node.tryGetContext('ingressIpAddress') || '10.0.0.0/16';
+
     appSecurityGroup.addIngressRule(
-      Peer.ipv4('0.0.0.0/0'), Port.tcp(80), 'allow port 80'
+      Peer.ipv4(ingressIp), Port.tcp(80), 'allow port 80'
     );
     // ECS Fargate Cluster
     const cluster = new Cluster(this, 'MyCluster', {

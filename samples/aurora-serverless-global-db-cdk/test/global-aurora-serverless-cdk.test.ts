@@ -1,11 +1,11 @@
 import { Template } from 'aws-cdk-lib/assertions';
-import { AuroraGlobalClusterStack } from '../lib/aurora-global-cluster-stack';
+import { AuroraGlobalClusterStack, GlobalClusterProps } from '../lib/aurora-global-cluster-stack';
 import { AuroraRegionalClusterStack } from '../lib/aurora-regional-cluster-stack'
 import { FargateTestAppStack } from '../lib/fargate-test-app-stack';
 import { AwsSolutionsChecks, NagSuppressions } from 'cdk-nag'
 
 import { Annotations, Match } from 'aws-cdk-lib/assertions';
-import { App, Aspects, Stack } from 'aws-cdk-lib';
+import { App, Aspects } from 'aws-cdk-lib';
 
 
 test('Validate Stack Resources', () => {
@@ -47,23 +47,26 @@ test('Validate Stack Resources', () => {
 });
 
 describe('cdk-nag AwsSolutions Pack', () => {
+    let globalclusterstack: AuroraGlobalClusterStack;
     let primaryclusterstack: AuroraRegionalClusterStack;
     let primarytestappstack: FargateTestAppStack;
     let app: App;
-    app = new App();
 
-    const account = app.node.tryGetContext('account') || process.env.CDK_INTEG_ACCOUNT || process.env.CDK_DEFAULT_ACCOUNT;
-    const primaryRegion = { account: account, region: 'eu-west-1' };
-
-    const globalclusterstack = new AuroraGlobalClusterStack(app, "AuroraGlobalCluster", {
-        env: primaryRegion,
-        crossRegionReferences: true
-    });
 
     // In this case we can use beforeAll() over beforeEach() since our tests 
     // do not modify the state of the application 
     beforeAll(() => {
         // GIVEN
+        app = new App();
+
+        const account = app.node.tryGetContext('account') || process.env.CDK_INTEG_ACCOUNT || process.env.CDK_DEFAULT_ACCOUNT;
+        const primaryRegion = { account: account, region: 'eu-west-1' };
+
+        globalclusterstack = new AuroraGlobalClusterStack(app, "AuroraGlobalCluster", {
+            env: primaryRegion,
+            crossRegionReferences: true
+        });
+
         primaryclusterstack = new AuroraRegionalClusterStack(app, `AuroraPrimaryCluster-${primaryRegion.region}`, {
             env: primaryRegion, cfnGlobalCluster: globalclusterstack.cfnGlobalCluster, isPrimary: true
         });
