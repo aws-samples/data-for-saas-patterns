@@ -80,8 +80,8 @@ This blog post discusses how to enforce row-level security in Amazon Aurora Post
 
 ### Videos :movie_camera:
 
-[ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
-[ Data for SaaS YouTube Playlist ](https://youtube.com/playlist?list=PLoqD0z_296PbKATwUcaGowmOJwlE_2ysP&si=kytUeU0uZsNrNF_R)
+* [ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
+* [ Data for SaaS YouTube Playlist ](https://youtube.com/playlist?list=PLoqD0z_296PbKATwUcaGowmOJwlE_2ysP&si=kytUeU0uZsNrNF_R)
 
 ## Security
 
