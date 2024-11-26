@@ -10,6 +10,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
+* * [Tenant isolation patterns](README.md#tenant-isolation-patterns)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
 * [Videos](README.md#videos-movie_camera)
 
@@ -41,14 +42,19 @@ This sample shows how to use pgvector in a multi-tenant database, enforcing tena
 
 ## Scheduled Autoscaling Aurora Serverless V2
 
-This sample provides a CDK application that creates a scheduled job to scale up and down an Aurora Serverless V2 instance minimum capacity. This is useful for SaaS applications with predictable usage patterns to reduce scaling times during busy periods. 
+This sample provides a CDK application that creates a scheduled job to scale up and down an Aurora Serverless V2 instance minimum capacity. This is useful for SaaS applications with predictable usage patterns to reduce scaling times during busy periods.
 
 [Scheduled Autoscaling Aurora Serverless V2](./samples/scheduled-aurora-serverless-scaling/)
 
 ## Aurora Global Database Serverless V2
+
 This sample provides a CDK application that creates Amazon Aurora Global database custer across a primary and secondary region for SaaS applications that need global footprint and for disaster recovery strategies. The stack also includes a Fargate container application to test the primary and secondary regions with CRUD API operations. 
 
 [Aurora Global Database Serverless V2](./samples/aurora-serverless-global-db-cdk/)
+
+## Tenant isolation patterns
+
+This sample provides tenant isolation patterns using [Attribute Based Access Control (ABAC)](https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction_attribute-based-access-control.html), implemented with [AssumeRoleWithWebIdentity](https://aws.amazon.com/blogs/security/saas-tenant-isolation-with-abac-using-aws-sts-support-for-tags-in-jwt/) for a robust tenant isolation mechanism.
 
 ## Data for SaaS Blogs :books:
 
