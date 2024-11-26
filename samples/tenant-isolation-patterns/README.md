@@ -8,8 +8,6 @@ Cognito is used for the identity provider, along with pre-token-generation to in
 
 ## Deployment
 
-As a pre-requisite, install [NodeJs](https://nodejs.org/en/download/package-manager).
-
 Install pre-requisite packages:
 
 ```bash
