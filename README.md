@@ -84,6 +84,12 @@ This blog post explains how to use Amazon Aurora PostgreSQL and Amazon EventBrid
 
 This blog post discusses how to enforce row-level security in Amazon Aurora PostgreSQL-Compatible Edition using the RDS Data API and PostgreSQL features. It provides an overview of row-level security policies in PostgreSQL and demonstrates how to create a shared tenant schema, define a row-level security policy, and test the tenant isolation using both traditional connection management and the RDS Data API. The post highlights the benefits of using the RDS Data API for securely querying filtered data without managing database connections or connection pools. It also covers cost considerations, metering strategies, and cleanup steps. Overall, the post aims to help readers build secure and scalable multi-tenant PostgreSQL architectures on AWS.
 
+### [Partitioning and Isolating Multi-Tenant SaaS Data with Amazon S3](https://aws.amazon.com/blogs/apn/partitioning-and-isolating-multi-tenant-saas-data-with-amazon-s3/)
+
+This blog post discusses various strategies for partitioning and isolating multi-tenant data using Amazon S3 in SaaS applications, presenting three main approaches: bucket-per-tenant model, object key prefix-per-tenant model, and database-mapped tenant objects. The bucket-per-tenant model assigns separate buckets for each tenant but has limitations due to AWS bucket quotas, while the prefix-per-tenant model allows better scalability by using key name prefixes to associate objects with tenants within shared buckets. For enhanced security, the article explains how tenant isolation can be achieved through IAM policies, access points, and encryption using AWS KMS, with options for server-side encryption and envelope encryption. The blog also covers tenant activity tracking and cost management through features like S3 Inventory, server access logging, and cost allocation tags. Finally, this covers lifecycle management options for different tenant tiers and recommends additional security and cost management configurations such as S3 Intelligent-Tiering, disabling ACLs, and implementing S3 Block Public Access.
+
+Note: The blog mentions hard quota of 1,000 buckets per AWS account. However, this has been increased to 1 million starting [Nov 2024](https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-up-1-million-buckets-per-aws-account/) 
+
 ### Videos :movie_camera:
 
 * [ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
