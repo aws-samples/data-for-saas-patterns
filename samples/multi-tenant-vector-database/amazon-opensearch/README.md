@@ -30,7 +30,7 @@ Using the vector data store capabilities of Amazon OpenSearch, you can implement
     ```
 3. Deploy the CloudFormation stack:
     ```
-    aws cloudformation create-stack --stack-name opensearch-stack --template-body file://opensearch-template.yaml --capabilities CAPABILITY_NAMED_IAM --region us-west-2
+    aws cloudformation create-stack --stack-name opensearch-stack --template-body file://opensearch-template.yaml --capabilities CAPABILITY_NAMED_IAM --region us-west-2 ParameterKey=KeyPair,ParameterValue=default-keypair
     ```
     
 4. Note the outputs from the CloudFormation stack. These contain resources ARNs and endpoints needed for the notebooks.
