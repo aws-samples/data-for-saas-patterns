@@ -1,0 +1,32 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "OpenSearchCollectionStatementID",
+            "Effect": "Allow",
+            "Action": [
+                "aoss:DescribeCollectionItems",
+                "aoss:CreateCollectionItems",
+                "aoss:UpdateCollectionItems",
+                "aoss:APIAccessAll"
+            ],
+            "Resource": [
+                "#opensearch_collection_arn#"
+            ]
+        },
+        {
+            "Sid": "OpenSearchIndexStatementID",
+            "Effect": "Allow",
+            "Action": [
+                "aoss:UpdateIndex",
+                "aoss:DescribeIndex",
+                "aoss:ReadDocument",
+                "aoss:WriteDocument",
+                "aoss:CreateIndex"
+            ],
+            "Resource": [
+                "#opensearch_collection_arn#"
+            ]
+        }
+    ]
+}
