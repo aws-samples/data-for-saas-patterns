@@ -26,7 +26,7 @@ This scaling characteristic starting from 0.5, 8 and 32 ACU and scaling to 128 A
 
 ## Architecture
 
-The scheduled autoscaling sample uses a serverless architecture to schedule and perform the scaling activity. The schedule is managed using Amazon EventBridge. When the cron schedule triggers, this invokes the RDS modify-db-cluster API using the EventBridg universal target. This modifies the database to adjust the min/max ACU to the desired levels. 
+The scheduled autoscaling sample uses a serverless architecture to schedule and perform the scaling activity. The schedule is managed using Amazon EventBridge. When the cron schedule triggers, this invokes the RDS modify-db-cluster API using the EventBridge universal target. This modifies the database to adjust the min/max ACU to the desired levels. 
 
 **NOTE:** It is important that you use the Secrets Manager integration for managing the RDS master user when using this solution. The `modify-db-cluster` API command used to update the ACU also allows for changing the master user password. To prevent this, the secret should be stored in Secrets Manager and the EventBridge schedule execution role should not have access to this secret. 
 
