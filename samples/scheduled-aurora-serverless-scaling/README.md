@@ -26,9 +26,9 @@ This scaling characteristic starting from 0.5, 8 and 32 ACU and scaling to 128 A
 
 ## Architecture
 
-The scheduled autoscaling sample uses a serverless architecture to schedule and perform the scaling activity. The schedule is managed using Amazon EventBridge. When the cron schedule triggers, this invokves an AWS Lambda function that modifies the database to adjust the min/max ACU to the desired levels. 
+The scheduled autoscaling sample uses a serverless architecture to schedule and perform the scaling activity. The schedule is managed using Amazon EventBridge. When the cron schedule triggers, this invokes the RDS modify-db-cluster API using the EventBridge universal target. This modifies the database to adjust the min/max ACU to the desired levels. 
 
-**NOTE:** It is important that you use the Secrets Manager integration for managing the RDS master user when using this solution. The `modify-db-cluster` API command used to update the ACU also allows for changing the master user password. To prevent this, the secret should be stored in Secrets Manager and the Lambda function execution role should not have access to this secret. 
+**NOTE:** It is important that you use the Secrets Manager integration for managing the RDS master user when using this solution. The `modify-db-cluster` API command used to update the ACU also allows for changing the master user password. To prevent this, the secret should be stored in Secrets Manager and the EventBridge schedule execution role should not have access to this secret. 
 
 ![arch diagram](./images/architecture.png)
 
@@ -60,6 +60,20 @@ To define your cron schedule to scale up and down and the min/max for each scali
 
 To deploy the solution:
 
+1. Change to the solution directory:
+
+```
+cd ./samples/scheduled-aurora-serverless-scaling 
+```
+
+2. Install dependencies:
+```
+npm i
+```
+
+3. If you are running CDK for the first time, you may need to run CDK bootstrap first, see [Bootstrap your environment](https://docs.aws.amazon.com/cdk/v2/guide/bootstrapping-env.html)
+
+4. Deploy the CDK app:
 ```
 cdk deploy
 ```

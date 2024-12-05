@@ -1,8 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
-import { Rule, RuleTargetInput, Schedule } from 'aws-cdk-lib/aws-events';
-import { LambdaFunction } from 'aws-cdk-lib/aws-events-targets';
-import { Policy, PolicyStatement, Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
-import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
+import { CfnSchedule } from 'aws-cdk-lib/aws-scheduler';
+import { Role, PolicyStatement, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
 export class ScheduledAutoscalingAmazonAuroraServerlessStack extends cdk.Stack {
@@ -10,64 +8,60 @@ export class ScheduledAutoscalingAmazonAuroraServerlessStack extends cdk.Stack {
     super(scope, id, props);
 
     const scheduleUp = this.node.tryGetContext('scheduleUp');
-    const desiredCapacityUpMin = this.node.tryGetContext('desiredCapacityUpMin');
-    const desiredCapacityUpMax = this.node.tryGetContext('desiredCapacityUpMax');
+    const desiredCapacityUpMin: number = this.node.tryGetContext('desiredCapacityUpMin');
+    const desiredCapacityUpMax: number = this.node.tryGetContext('desiredCapacityUpMax');
     const scheduleDown = this.node.tryGetContext('scheduleDown');
-    const desiredCapacityDownMin = this.node.tryGetContext('desiredCapacityDownMin');
-    const desiredCapacityDownMax = this.node.tryGetContext('desiredCapacityDownMax');
+    const desiredCapacityDownMin: number = this.node.tryGetContext('desiredCapacityDownMin');
+    const desiredCapacityDownMax: number = this.node.tryGetContext('desiredCapacityDownMax');
     const dbClusterId = this.node.tryGetContext('dbClusterId');
 
-    const scalingFunction = new NodejsFunction(this, 'ScalingFunction', {
-      entry: 'lambda/app.ts',
-      handler: 'lambdaHandler',
-      runtime: cdk.aws_lambda.Runtime.NODEJS_20_X,
-      bundling: {
-        minify: true,
-        externalModules: ['@aws-sdk/client-rds'],
-      },
+    const schedulerRole = new Role(this, 'SchedulerRole', {
+      assumedBy: new ServicePrincipal('scheduler.amazonaws.com')
     });
-    scalingFunction.role?.attachInlinePolicy(new Policy(this, 'ScalingFunctionPolicy', {
-      statements: [new PolicyStatement({
-          actions: [
-            'rds:ModifyDBCluster'
-          ],
-          resources: [
-            `arn:aws:rds:${this.region}:${this.account}:cluster:${dbClusterId}`
-          ]
-        })]
+
+    schedulerRole.addToPolicy(new PolicyStatement({
+      actions: ['rds:ModifyDBCluster'],
+      resources: [`arn:aws:rds:${this.region}:${this.account}:cluster:${dbClusterId}`]
     }));
 
-    const role = new Role(this, 'EBScheduleRole', {
-      assumedBy: new ServicePrincipal('events.amazonaws.com')
-    });
-    scalingFunction.grantInvoke(role);
-
     if (scheduleUp && desiredCapacityUpMin && desiredCapacityUpMax) {
-      const ebScheduleUp = new Rule(this, 'EBScheduleUp', {
-        schedule: Schedule.expression(scheduleUp)
+      new CfnSchedule(this, 'ScaleUpSchedule', {
+        flexibleTimeWindow: {
+          mode: 'OFF'
+        },
+        scheduleExpression: scheduleUp,
+        target: {
+          arn: `arn:aws:scheduler:::aws-sdk:rds:modifyDBCluster`,
+          roleArn: schedulerRole.roleArn,
+          input: `{"DbClusterIdentifier":"${dbClusterId}","ServerlessV2ScalingConfiguration":{"MinCapacity":${desiredCapacityUpMin},"MaxCapacity":${desiredCapacityUpMax}}}`,
+          retryPolicy: {
+            maximumRetryAttempts: 3
+          }
+        },
+        name: `${id}-scale-up`,
+        description: 'Scale up Aurora Serverless cluster during business hours',
+        state: 'ENABLED'
       });
-
-      ebScheduleUp.addTarget(new LambdaFunction(scalingFunction, {
-        event: RuleTargetInput.fromObject({
-          desiredMinCapacity: desiredCapacityUpMin,
-          desiredMaxCapacity: desiredCapacityUpMax,
-          targetDbCluster: dbClusterId
-        })
-      }));
     }
 
     if (scheduleDown && desiredCapacityDownMin && desiredCapacityDownMax) {
-      const ebScheduleDown = new Rule(this, 'EBScheduleDown', {
-        schedule: Schedule.expression(scheduleDown)
+      new CfnSchedule(this, 'ScaleDownSchedule', {
+        flexibleTimeWindow: {
+          mode: 'OFF'
+        },
+        scheduleExpression: scheduleDown,
+        target: {
+          arn: `arn:aws:scheduler:::aws-sdk:rds:modifyDBCluster`,
+          roleArn: schedulerRole.roleArn,
+          input: `{"DbClusterIdentifier":"${dbClusterId}","ServerlessV2ScalingConfiguration":{"MinCapacity":${desiredCapacityDownMin},"MaxCapacity":${desiredCapacityDownMax}}}`,
+          retryPolicy: {
+            maximumRetryAttempts: 3
+          }
+        },
+        name: `${id}-scale-down`,
+        description: 'Scale down Aurora Serverless cluster during non-business hours',
+        state: 'ENABLED'
       });
-
-      ebScheduleDown.addTarget(new LambdaFunction(scalingFunction, {
-        event: RuleTargetInput.fromObject({
-          desiredMinCapacity: desiredCapacityDownMin,
-          desiredMaxCapacity: desiredCapacityDownMax,
-          targetDbCluster: dbClusterId
-        })
-      }));
     }
   }
 }
