@@ -351,7 +351,6 @@ Resources:
             Principal:
               AWS:
                 - "*"
-                #- !GetAtt OpenSearchAdminRole.Arn
             Action:
               - "es:ESHttp*"
             Resource:
@@ -558,9 +557,6 @@ Resources:
                           send_cfn_response(event, context, "FAILED", response_data)
                       return
 
-                  #
-                  # Do stuff
-                  #
                   paginator = s3_client.get_paginator('list_object_versions')
                   iterator = paginator.paginate(Bucket=parameters['Bucket'])
                   for page in iterator:
