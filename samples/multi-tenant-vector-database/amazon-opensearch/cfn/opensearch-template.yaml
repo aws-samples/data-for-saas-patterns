@@ -1,0 +1,955 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Amazon OpenSearch template to create OpenSearch provisioned and serverless"
+
+Parameters:
+  EnvironmentName:
+    Description: Environment name used for tagging
+    Type: String
+    Default: development
+
+  VpcCIDR:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: CIDR block for Public Subnet 1
+    Type: String
+    Default: 10.0.1.0/24
+
+  PublicSubnet2CIDR:
+    Description: CIDR block for Public Subnet 1
+    Type: String
+    Default: 10.0.2.0/24
+
+  PrivateSubnet1CIDR:
+    Description: CIDR block for Public Subnet 1
+    Type: String
+    Default: 10.0.3.0/24
+
+  PrivateSubnet2CIDR:
+    Description: CIDR block for Public Subnet 1
+    Type: String
+    Default: 10.0.4.0/24
+
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+    Description: The latest Amazon Linux 2 AMI from Systems Manager Parameter Store
+
+  BastionHostAllowedIP:
+    Type: String
+    Description: Bastion host ingress IP e.g. your local IP address
+    Default: 89.243.99.228/32
+
+  KeyPair:
+    Description: SSH Keypair name to access bastion host
+    Type: String
+    Default: "default-keypair"
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnet 1
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-1
+
+  # Public Subnet 2
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-subnet-2
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-rt
+
+  # Public Route
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate Public Subnet 1 with Public Route Table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  # Associate Public Subnet 2 with Public Route Table
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Private Subnet 1
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-1
+
+  # Private Subnet 2
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-subnet-2
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-rt
+
+  # Private Route
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  # Associate Public Subnet 1 with Public Route Table
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  # Associate Public Subnet 2 with Public Route Table
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  BastionHostSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Bastion Host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref BastionHostAllowedIP
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion-sg
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref LatestAmiId # We'll define this in Parameters
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BastionHostSecurityGroup
+      KeyName: !Ref KeyPair
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-bastion-host
+
+  # Security Group
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC resources
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BastionHostSecurityGroup
+          Description: HTTPS access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCIDR
+          Description: HTTPS access
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-security-group
+
+  # Secrets Manager Secret
+  OpenSearchMasterUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}-opensearch-master-user
+      Description: "OpenSearch master user credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-opensearch-secret
+
+  # OpenSearch Admin Role
+  OpenSearchAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "opensearch-admin-role"
+      Description: IAM role for OpenSearch administration
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - opensearchservice.amazonaws.com
+                - es.amazonaws.com
+                - aoss.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+
+  # OpenSearch Admin Policy
+  OpenSearchAdminPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${EnvironmentName}-opensearch-admin-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "es:*"
+            Resource:
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-domain/*"
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-domain"
+          - Effect: Allow
+            Action:
+              - "iam:PassRole"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "aoss:CreateIndex"
+              - "aoss:APIAccessAll"
+              - "aoss:DashboardsAccessAll"
+            Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+          - Effect: Allow
+            Action:
+              - "aoss:DashboardsAccessAll"
+            Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:dashboards/*"
+      Roles:
+        - !Ref OpenSearchAdminRole
+
+  #OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Sub ${EnvironmentName}-domain
+      EngineVersion: "OpenSearch_2.17"
+      ClusterConfig:
+        InstanceType: "t3.small.search"
+        InstanceCount: 2
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 2
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: "Policy-Min-TLS-1-2-2019-07"
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          #MasterUserARN: !GetAtt OpenSearchAdminRole.Arn # Used only when InternalUserDatabaseEnabled: false
+          MasterUserName: !Sub "{{resolve:secretsmanager:${OpenSearchMasterUserSecret}:SecretString:username}}"
+          MasterUserPassword: !Sub "{{resolve:secretsmanager:${OpenSearchMasterUserSecret}:SecretString:password}}"
+      VPCOptions:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+      AccessPolicies:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - "*"
+            Action:
+              - "es:ESHttp*"
+            Resource:
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-domain/*"
+              - !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-domain"
+
+  # OpenSearch Serverless Collection Resources
+  OpenSearchVPCEndpoint:
+    Type: "AWS::OpenSearchServerless::VpcEndpoint"
+    Properties:
+      Name: opensearch-vpce
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref OpenSearchSecurityGroup
+
+  DataAccessPolicy:
+    Type: "AWS::OpenSearchServerless::AccessPolicy"
+    Properties:
+      Name: vector-store-access-policy
+      Type: data
+      Description: Access policy for vector-store collection
+      Policy: !Sub |
+        [{
+          "Description":"Access for cfn user",
+          "Rules":[
+            {
+              "ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]
+            },
+            {
+              "ResourceType":"collection",
+              "Resource":["collection/vector-store"],
+              "Permission":["aoss:*"]
+            }
+          ],
+          "Principal": [
+            "arn:aws:iam::${AWS::AccountId}:role/bedrock_kb_service_role_os",
+            "${OpenSearchAdminRole.Arn}",
+            "${ServerlessCollectionIndexFunctionRole.Arn}"
+          ]
+        }]
+
+  NetworkPolicy:
+    Type: "AWS::OpenSearchServerless::SecurityPolicy"
+    Properties:
+      Name: vector-store-network-policy
+      Type: network
+      Description: Network policy for vector-store collection
+      Policy: !Sub |
+        [{
+        "Rules":[
+            {
+              "ResourceType":"collection",
+              "Resource":["collection/vector-store"]
+            },
+            {
+              "ResourceType":"dashboard",
+              "Resource":["collection/vector-store"]
+            }
+          ],
+          "SourceVPCEs": ["${OpenSearchVPCEndpoint}"],
+          "SourceServices": ["bedrock.amazonaws.com"]
+        }]
+
+  EncryptionPolicy:
+    Type: "AWS::OpenSearchServerless::SecurityPolicy"
+    Properties:
+      Name: vector-store-security-policy
+      Type: encryption
+      Description: Encryption policy for vector-store collection
+      Policy: >-
+        {
+          "Rules":[
+            {
+              "ResourceType":"collection",
+              "Resource":["collection/vector-store"]
+            }
+          ],
+          "AWSOwnedKey":true
+        }
+
+  Collection:
+    Type: "AWS::OpenSearchServerless::Collection"
+    Properties:
+      Name: vector-store
+      Type: VECTORSEARCH
+      Description: Collection to hold vector embeddings
+    DependsOn:
+      - EncryptionPolicy
+      - PublicSubnet1
+      - PublicSubnet2
+      - PublicRoute
+      - PublicRouteTable
+      - InternetGateway
+
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-${AWS::AccountId}
+
+  EmptyS3BucketFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "EmptyS3BucketFunctionRights"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:DeleteObjectVersion"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketVersions"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub "${LambdaCodeBucket.Arn}/*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  EmptyS3BucketFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Deletes all objects and object versions from an S3 bucket"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt EmptyS3BucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import json
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.DEBUG)
+
+          s3_client = boto3.client('s3')
+
+          # Add cfnresponse
+          def send_cfn_response(event, context, response_status, response_data, reason=None):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': reason or "See the details in CloudWatch Log Stream",
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': False,
+                  'Data': response_data
+              }
+
+              response_json = json.dumps(response_body)
+
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_json))
+              }
+
+              try:
+                  import urllib3
+                  http = urllib3.PoolManager()
+                  response = http.request('PUT', event['ResponseURL'],
+                                        body=response_json.encode('utf-8'),
+                                        headers=headers)
+                  print(f"CloudFormation response status code: {response.status}")
+              except Exception as e:
+                  print(f"Failed to send CloudFormation response: {str(e)}")
+
+          def handler(event, context):
+              respond_to_cfn = not ('test' in event or (__name__ == "__main__"))
+              response_data = {}
+
+              if 'RequestType' not in event or event['RequestType'] != 'Delete':
+                  if respond_to_cfn:
+                      send_cfn_response(event, context, "SUCCESS", response_data)
+                  return
+
+              try:
+                  #
+                  # Validate inputs
+                  #
+                  if 'ResourceProperties' not in event:
+                      logger.error("Invalid event:  event does not contain 'ResourceProperties'")
+                      if respond_to_cfn:
+                          send_cfn_response(event, context, "FAILED", response_data)
+                      return
+
+                  parameters = event['ResourceProperties']
+                  if 'Bucket' not in parameters or len(parameters['Bucket']) < 1:
+                      logger.error("Bucket parameter not provided")
+                      if respond_to_cfn:
+                          send_cfn_response(event, context, "FAILED", response_data)
+                      return
+
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  iterator = paginator.paginate(Bucket=parameters['Bucket'])
+                  for page in iterator:
+                      if 'Versions' not in page:
+                          continue
+
+                      obj_list = []
+                      for version in page['Versions']:
+                          obj_list.append({'Key': version['Key'], 'VersionId': version['VersionId']})
+
+                      kill_object = {'Quiet': False, 'Objects': obj_list}
+                      s3_client.delete_objects(Bucket=parameters['Bucket'], Delete=kill_object)
+
+                  if respond_to_cfn:
+                      send_cfn_response(event, context, "SUCCESS", response_data)
+
+                  return response_data
+              except:
+                  logger.exception(event)
+
+                  if respond_to_cfn:
+                      send_cfn_response(event, context, "FAILED", response_data)
+
+  EmptyLambdaCodeBucket:
+    Type: Custom::EmptyLambdaCodeBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyS3BucketFunction.Arn
+      Bucket: !Ref LambdaCodeBucket
+
+  LayerCodeBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "LayerCodeBuilderS3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:DeleteObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt LambdaCodeBucket.Arn
+                  - !Sub "${LambdaCodeBucket.Arn}/*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LayerCodeBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: "Builds the code dependencies for the Lambda layer used by functions in this project"
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt LayerCodeBuilderRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref LambdaCodeBucket
+          S3_KEY_PREFIX: "export-code/"
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          import sys
+          import shutil
+          import subprocess
+          import zipfile
+
+          from datetime import datetime
+
+          target_bucket = os.environ['S3_BUCKET']
+
+          def upload_file_to_s3(file_path, bucket, key):
+              s3 = boto3.client('s3')
+              s3.upload_file(file_path, bucket, key)
+              print(f"Upload successful. {file_path} uploaded to {bucket}/{key}")
+
+          def make_zip_filename():
+            now = datetime.now()
+            timestamp = now.strftime('%Y%m%d_%H%M%S')
+            filename = f'PyOpenSearchExportLayers_{timestamp}.zip'
+            return filename
+
+          def zipdir(path, zipname):
+            zipf = zipfile.ZipFile(zipname, 'w', zipfile.ZIP_DEFLATED)
+            for root, dirs, files in os.walk(path):
+                for file in files:
+                    zipf.write(os.path.join(root, file),
+                              os.path.relpath(os.path.join(root, file),
+                                              os.path.join(path, '..')))
+            zipf.close()
+
+          def handler(event, context):
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+
+              layers = ['opensearch-py', 'requests_aws4auth', ]
+              os.chdir('/tmp')
+
+              # clear temp modules path, recreate modules path
+              if os.path.exists("python"):
+                shutil.rmtree("python")
+              os.mkdir("python")
+
+              for layer in layers:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", layer, "-t", "python", "--upgrade"])
+
+              target_zip_file = make_zip_filename()
+              zipdir('python', target_zip_file)
+
+              zipkey = ''
+              if 'S3_KEY_PREFIX' in os.environ:
+                zipkey = os.environ['S3_KEY_PREFIX']
+                if zipkey == '/':
+                  zipkey = ''
+                elif len(zipkey) > 0 and not zipkey.endswith('/'):
+                  zipkey = zipkey + '/'
+
+              zipkey = zipkey + target_zip_file
+
+              upload_file_to_s3(target_zip_file, target_bucket, zipkey)
+              responseData = {'Bucket': target_bucket, 'Key': zipkey}
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            except Exception as e:
+              print(e)
+              reason = f"Exception thrown: {e}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=reason)
+
+  # Invokes the function to build the zip file of dependencies that our Lambda layer will use
+  BuildLayerCode:
+    Type: Custom::BuildLambdaLayerCode
+    Properties:
+      ServiceToken: !GetAtt LayerCodeBuilderFunction.Arn
+
+  LambdaLayer:
+    Type: "AWS::Lambda::LayerVersion"
+    Properties:
+      LayerName: OpenSearchExportLayer
+      Content:
+        S3Bucket: !GetAtt BuildLayerCode.Bucket
+        S3Key: !GetAtt BuildLayerCode.Key
+      CompatibleRuntimes:
+        - python3.11
+
+  ServerlessCollectionIndexFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "ServerlessCollectionIndexFunctionPermissions"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "aoss:CreateIndex"
+                  - "aoss:APIAccessAll"
+                  - "aoss:DashboardsAccessAll"
+                  - "ec2:*"
+                Resource:
+                  - !GetAtt Collection.Arn
+              - Effect: "Allow"
+                Action:
+                  - "ec2:*"
+                Resource:
+                  - "*"
+              - Effect: "Allow"
+                Action:
+                  - "sts:AssumeRole"
+                Resource:
+                  - !GetAtt OpenSearchAdminRole.Arn
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  ServerlessCollectionIndexFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Create the vector store index in the serverless collection"
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Role: !GetAtt ServerlessCollectionIndexFunctionRole.Arn
+      Environment:
+        Variables:
+          Endpoint: !GetAtt Collection.CollectionEndpoint
+          Region: !Ref AWS::Region
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Layers:
+        - !Ref LambdaLayer
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import warnings
+          import os
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+
+          def send_cfn_response(event, context, response_status, response_data, reason=None):
+              response_body = {
+                  'Status': response_status,
+                  'Reason': reason or "See the details in CloudWatch Log Stream",
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': False,
+                  'Data': response_data
+              }
+
+              response_json = json.dumps(response_body)
+
+              print(event['ResponseURL'])
+
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_json))
+              }
+
+              try:
+                  import urllib3
+                  http = urllib3.PoolManager()
+                  response = http.request('PUT', event['ResponseURL'],
+                                        body=response_json.encode('utf-8'),
+                                        headers=headers)
+                  print(f"CloudFormation response status code: {response.status}")
+              except Exception as e:
+                  print(f"Failed to send CloudFormation response: {str(e)}")
+
+          os.environ["AWS_STS_REGIONAL_ENDPOINTS"] = "regional"
+          sts_client = boto3.client("sts")
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      print('CREATE')
+                      try:
+                          host = os.environ['Endpoint']
+                          host = host.replace("https://", "")
+                          service = 'aoss'
+                          region = os.environ.get('AWS_REGION', 'us-east-1')
+                          session_name = "opensearch-admin-session"
+
+                          account_id = sts_client.get_caller_identity().get("Account")
+                          admin_role_arn = f"arn:aws:iam::{account_id}:role/opensearch-admin-role"
+
+                          assumed_role = sts_client.assume_role(RoleArn=admin_role_arn,RoleSessionName=session_name)
+                          credentials = assumed_role['Credentials']
+
+                          awsauth = AWS4Auth(
+                              credentials['AccessKeyId'],
+                              credentials['SecretAccessKey'],
+                              region,
+                              service,
+                              session_token=credentials['SessionToken']
+                          )
+
+                          opensearch_client = OpenSearch(
+                              hosts=[{'host': host, 'port': 443}],
+                              http_auth=awsauth,
+                              use_ssl=True,
+                              verify_certs=False,
+                              connection_class=RequestsHttpConnection,
+                              timeout=300,
+                              retry_on_timeout=True,
+                              max_retries=3,
+                              region_name=region
+                          )
+
+                          index_name = "fully-managed-vector-store-index"
+                          settings = {
+                              "settings": {
+                                  "index.knn": "true"
+                              },
+                              "mappings": {
+                                  "properties": {
+                                      "embeddings": {
+                                          "type": "knn_vector",
+                                          "dimension": 1536,
+                                          "method": {
+                                              "engine": "faiss",
+                                              "name": "hnsw"
+                                          }
+                                      },
+                                      "chunk": {
+                                          "type": "text"
+                                      },
+                                      "metadata": {
+                                          "type": "text"
+                                      }
+                                  }
+                              }
+                          }
+
+                          response = opensearch_client.indices.create(
+                              index=index_name,
+                              body=settings
+                          )
+
+                          print('\nCreating index:')
+                          print(response)
+
+                          print(f"Successfully Created the Index ")
+                          send_cfn_response(event, context, 'SUCCESS', response)
+
+                      except Exception as e:
+                          print(e)
+                          reason = f"Exception thrown: {e}"
+                          send_cfn_response(event, context, 'FAILED', {}, reason=reason)
+
+                  elif event['RequestType'] == 'Update':
+                      print('UPDATE')
+                      send_cfn_response(event, context, "SUCCESS",
+                                    {"Message": "Resource update successful!"})
+                  elif event['RequestType'] == 'Delete':
+                      print('DELETE')
+                      send_cfn_response(event, context, "SUCCESS",
+                                    {"Message": "Resource deletion successful!"})
+                  else:
+                      print('FAILED')
+                      send_cfn_response(event, context, "FAILED",
+                                    {"Message": "Unexpected event received from CloudFormation"})
+              except:
+                  print('FAILED')
+                  send_cfn_response(event, context, "FAILED", {
+                      "Message": "Exception during processing"})
+
+  CreateServerlessCollectionIndex:
+    Type: Custom::CreateServerlessCollectionIndex
+    DeletionPolicy: "Retain"
+    Properties:
+      ServiceToken: !GetAtt ServerlessCollectionIndexFunction.Arn
+      ServiceTimeout: 300
+
+Outputs:
+  BastionHostPublicIP:
+    Description: Public IP address of the Bastion Host
+    Value: !GetAtt BastionHost.PublicIp
+
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-DomainEndpoint
+
+  OpenSearchDashboardURL:
+    Description: OpenSearch Dashboard URL
+    Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards/"
+
+  OpenSearchAdminRoleArn:
+    Description: ARN of the OpenSearch admin role
+    Value: !GetAtt OpenSearchAdminRole.Arn
+
+  OpenSearchServerlessDashboardURL:
+    Value: !GetAtt Collection.DashboardEndpoint
+
+  OpenSearchServerlessCollectionId:
+    Description: The ID of the created collection
+    Value: !Ref Collection
+
+  OpenSearchServerlessCollectionARN:
+    Description: The ARN of the created collection
+    Value: !GetAtt Collection.Arn
+
+  OpenSearchServerlessCollectionEndpoint:
+    Description: The endpoint of the created collection
+    Value: !GetAtt Collection.CollectionEndpoint

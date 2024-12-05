@@ -40,6 +40,20 @@ This sample shows how to use pgvector in a multi-tenant database, enforcing tena
 
 [Example 2 - AWS-managed](./samples/multi-tenant-vector-database/amazon-aurora/aws-managed/)
 
+### Amazon OpenSearch
+
+Amazon OpenSearch Service offers powerful vector search capabilities in both provisioned and serverless deployment options. These vector stores enable efficient similarity searches on high-dimensional data, making them ideal for applications like semantic search, recommendation systems, and image recognition. With provisioned OpenSearch, users have granular control over cluster configuration and scaling, while the serverless option provides on-demand, automatically scaled resources without the need to manage infrastructure.
+
+You can use the CloudFormation template to provision the Amazon OpenSearch provisioned domain and the serverless collection, that are prerequisites to run this sample.
+
+[Deploy Amazon OpenSearch using CloudFormation](./samples/multi-tenant-vector-database/amazon-opensearch/README.md)
+
+This sample describes both the self-managed Retrieval-augmented generation (RAG) implementation and also the fully-managed RAG approach using [Amazon Bedrock knowledge bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html).
+
+[Example 1 - Self-managed](./samples/multi-tenant-vector-database/amazon-opensearch/self-managed/opensearch_self_managed_notebook.ipynb)
+
+[Example 2 - Fully-managed](./samples/multi-tenant-vector-database/amazon-opensearch/fully-managed/opensearch_fully_managed_notebook.ipynb)
+
 ## Scheduled Autoscaling Aurora Serverless V2
 
 This sample provides a CDK application that creates a scheduled job to scale up and down an Aurora Serverless V2 instance minimum capacity. This is useful for SaaS applications with predictable usage patterns to reduce scaling times during busy periods.
