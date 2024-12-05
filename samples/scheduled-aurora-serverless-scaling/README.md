@@ -60,6 +60,20 @@ To define your cron schedule to scale up and down and the min/max for each scali
 
 To deploy the solution:
 
+1. Change to the solution directory:
+
+```
+cd ./samples/scheduled-aurora-serverless-scaling 
+```
+
+2. Install dependencies:
+```
+npm i
+```
+
+3. If you are running CDK for the first time, you may need to run CDK bootstrap first, see [Bootstrap your environment](https://docs.aws.amazon.com/cdk/v2/guide/bootstrapping-env.html)
+
+4. Deploy the CDK app:
 ```
 cdk deploy
 ```
