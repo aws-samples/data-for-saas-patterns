@@ -5,5 +5,5 @@
     "scheduleDown": "cron(0 18 * * ? *)",
     "desiredCapacityDownMin": "0.5",
     "desiredCapacityDownMax": "8",
-    "dbClusterId": "scalingtarget"
+    "dbClusterIds": ["scalingtarget"]
 }
