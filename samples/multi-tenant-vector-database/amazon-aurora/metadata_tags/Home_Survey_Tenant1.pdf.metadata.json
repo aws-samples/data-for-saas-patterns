@@ -1,4 +1,5 @@
 {
-    "metadataAttributes" : { 
-        "tenantid" : "Tenant1"    }
+    "metadataAttributes": {
+        "tenantid": 1
+    }
 }
