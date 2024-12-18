@@ -11,14 +11,14 @@ CREATE SCHEMA self_managed;
 
 --Step 4 : Create the Vector table
 
-CREATE TABLE self_managed.kb (id uuid PRIMARY KEY, embedding vector(1536), chunks TEXT, metadata JSONB, tenantid BIGINT);
+CREATE TABLE self_managed.kb (id uuid PRIMARY KEY, embedding vector(1536), chunks text, metadata jsonb, tenantid bigint);
 
---Step 5 : Create the Index 
+--Step 5 : Create the Index
 
 CREATE INDEX on self_managed.kb USING hnsw (embedding vector_cosine_ops);
 
 -- Step 6 : Enable Row Level Security
-CREATE POLICY tenant_policy ON self_managed.kb USING (tenantid = current_setting('self_managed.kb.tenantid')::BIGINT);
+CREATE POLICY tenant_policy ON self_managed.kb USING (tenantid = current_setting('self_managed.kb.tenantid')::bigint);
 
 ALTER TABLE self_managed.kb enable row level security;
 

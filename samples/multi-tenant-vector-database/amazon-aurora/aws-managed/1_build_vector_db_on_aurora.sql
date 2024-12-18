@@ -14,7 +14,7 @@ GRANT ALL ON SCHEMA aws_managed to bedrock_user;
 
 --Step 4 : Create the Vector table
 
-CREATE TABLE aws_managed.kb (id uuid PRIMARY KEY, embedding vector(1536), chunks text, metadata jsonb, tenantid BIGINT);
+CREATE TABLE aws_managed.kb (id uuid PRIMARY KEY, embedding vector(1536), chunks text, metadata jsonb, tenantid bigint);
 GRANT ALL ON TABLE aws_managed.kb to bedrock_user;
 
 --Step 5 : Create the Index
