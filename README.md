@@ -104,6 +104,10 @@ This blog post discusses various strategies for partitioning and isolating multi
 
 Note: The blog mentions hard quota of 1,000 buckets per AWS account. However, this has been increased to 1 million starting [Nov 2024](https://aws.amazon.com/about-aws/whats-new/2024/11/amazon-s3-up-1-million-buckets-per-aws-account/) 
 
+### [Multi-tenant RAG with Amazon Bedrock Knowledge Bases](https://aws.amazon.com/blogs/machine-learning/multi-tenant-rag-with-amazon-bedrock-knowledge-bases/)
+
+The blog provides a technical deep-dive into implementing multi-tenant RAG architecture using Amazon Bedrock Knowledge Bases, integrating with Amazon S3 for document storage, OpenSearch Service for vector database, and DynamoDB for tenant configuration management. The implementation includes detailed code examples for metadata filtering, tenant configuration storage, and API interactions using AWS SDK for Python (Boto3), specifically demonstrating the usage of RetrieveAndGenerate API with knowledge base configurations and vector search filtering. The solution addresses technical challenges around document chunking, vector embeddings, HNSW algorithm parameters, and considers performance limitations such as ingestion job sizes (max 100GB), document limits (5 million documents per data source), and embedding model throughput.
+
 ### Videos :movie_camera:
 
 * [ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
