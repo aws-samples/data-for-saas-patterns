@@ -47,6 +47,19 @@ Parameters:
     Type: String
     Default: "default-keypair"
 
+  CreateServiceLinkedRoleParameter:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: "Whether to create the OpenSearch Service Linked Role"
+
+Conditions:
+  CreateServiceLinkedRole: !Equals
+    - !Ref CreateServiceLinkedRoleParameter
+    - true
+
 Resources:
   VPC:
     Type: AWS::EC2::VPC
@@ -241,10 +254,10 @@ Resources:
           Value: !Sub ${EnvironmentName}-security-group
 
   # Secrets Manager Secret
-  OpenSearchMasterUserSecret:
+  OpenSearchAdminUserSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub ${EnvironmentName}-opensearch-master-user
+      Name: OpenSearchAdminUserSecret
       Description: "OpenSearch master user credentials"
       GenerateSecretString:
         SecretStringTemplate: '{"username": "admin"}'
@@ -253,7 +266,7 @@ Resources:
         ExcludeCharacters: '"@/\\'
       Tags:
         - Key: Name
-          Value: !Sub ${EnvironmentName}-opensearch-secret
+          Value: OpenSearchAdminUserSecret
 
   # OpenSearch Admin Role
   OpenSearchAdminRole:
@@ -307,6 +320,13 @@ Resources:
       Roles:
         - !Ref OpenSearchAdminRole
 
+  OpenSearchServiceLinkedRole:
+    Type: AWS::IAM::ServiceLinkedRole
+    Properties:
+      AWSServiceName: es.amazonaws.com
+      Description: Service Linked Role for OpenSearch Service
+    Condition: CreateServiceLinkedRole
+
   #OpenSearch Domain
   OpenSearchDomain:
     Type: AWS::OpenSearchService::Domain
@@ -336,8 +356,8 @@ Resources:
         InternalUserDatabaseEnabled: true
         MasterUserOptions:
           #MasterUserARN: !GetAtt OpenSearchAdminRole.Arn # Used only when InternalUserDatabaseEnabled: false
-          MasterUserName: !Sub "{{resolve:secretsmanager:${OpenSearchMasterUserSecret}:SecretString:username}}"
-          MasterUserPassword: !Sub "{{resolve:secretsmanager:${OpenSearchMasterUserSecret}:SecretString:password}}"
+          MasterUserName: !Sub "{{resolve:secretsmanager:${OpenSearchAdminUserSecret}:SecretString:username}}"
+          MasterUserPassword: !Sub "{{resolve:secretsmanager:${OpenSearchAdminUserSecret}:SecretString:password}}"
       VPCOptions:
         SubnetIds:
           - !Ref PrivateSubnet1
@@ -924,32 +944,58 @@ Outputs:
   BastionHostPublicIP:
     Description: Public IP address of the Bastion Host
     Value: !GetAtt BastionHost.PublicIp
+    Export:
+      Name: BastionHostPublicIP
 
   OpenSearchDomainEndpoint:
     Description: OpenSearch domain endpoint
     Value: !GetAtt OpenSearchDomain.DomainEndpoint
     Export:
-      Name: !Sub ${AWS::StackName}-DomainEndpoint
+      Name: OpenSearchDomainEndpoint
 
   OpenSearchDashboardURL:
     Description: OpenSearch Dashboard URL
     Value: !Sub "https://${OpenSearchDomain.DomainEndpoint}/_dashboards/"
+    Export:
+      Name: OpenSearchDomainDashboardURL
 
   OpenSearchAdminRoleArn:
     Description: ARN of the OpenSearch admin role
     Value: !GetAtt OpenSearchAdminRole.Arn
+    Export:
+      Name: OpenSearchDomainAdminRoleArn
 
   OpenSearchServerlessDashboardURL:
     Value: !GetAtt Collection.DashboardEndpoint
+    Export:
+      Name: OpenSearchServerlessDashboardURL
 
   OpenSearchServerlessCollectionId:
     Description: The ID of the created collection
     Value: !Ref Collection
+    Export:
+      Name: OpenSearchServerlessCollectionId
 
   OpenSearchServerlessCollectionARN:
     Description: The ARN of the created collection
     Value: !GetAtt Collection.Arn
+    Export:
+      Name: OpenSearchServerlessCollectionArn
 
   OpenSearchServerlessCollectionEndpoint:
     Description: The endpoint of the created collection
     Value: !GetAtt Collection.CollectionEndpoint
+    Export:
+      Name: OpenSearchServerlessCollectionEndpoint
+
+  VectorStoreVPC:
+    Description: The ID of the VPC
+    Value: !Ref VPC
+    Export:
+      Name: VectorStore-VPC-ID
+
+  VectorStorePublicSubnet1:
+    Description: The ID of Public Subnet 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: VectorStore-PublicSubnet1-ID
