@@ -21,3 +21,6 @@ GRANT ALL ON TABLE aws_managed.kb to bedrock_user;
 
 CREATE INDEX on aws_managed.kb USING hnsw (embedding vector_cosine_ops);
 
+-- Step 6 : Create a GIN index on the chunks column for full-text search
+CREATE INDEX ON aws_managed.kb USING gin (to_tsvector('simple', chunks));
+
