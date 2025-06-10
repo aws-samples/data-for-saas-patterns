@@ -108,6 +108,12 @@ Note: The blog mentions hard quota of 1,000 buckets per AWS account. However, th
 
 The blog provides a technical deep-dive into implementing multi-tenant RAG architecture using Amazon Bedrock Knowledge Bases, integrating with Amazon S3 for document storage, OpenSearch Service for vector database, and DynamoDB for tenant configuration management. The implementation includes detailed code examples for metadata filtering, tenant configuration storage, and API interactions using AWS SDK for Python (Boto3), specifically demonstrating the usage of RetrieveAndGenerate API with knowledge base configurations and vector search filtering. The solution addresses technical challenges around document chunking, vector embeddings, HNSW algorithm parameters, and considers performance limitations such as ingestion job sizes (max 100GB), document limits (5 million documents per data source), and embedding model throughput.
 
+### [Amazon DynamoDB data modeling for Multi-Tenancy](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-1/)
+
+This blog series walks through the process of creating a DynamoDB data model using an example multi-tenant application, a customer issue tracking service. The goal of this series is to explore areas that are important for decision-making and provide insights into the influences to help you plan your data model for a multi-tenant application.
+
+In [part1](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-1/), we define the access patterns and decide on the table design. In [Part 2](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-2/), we select a partition key design and create the data schema by iterating across the access patterns. Finally, in [Part 3](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-3/), we validate the data model and explore how to extend the model as new access patterns emerge.
+
 ### Videos :movie_camera:
 
 * [ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
