@@ -114,6 +114,14 @@ This blog series walks through the process of creating a DynamoDB data model usi
 
 In [part1](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-1/), we define the access patterns and decide on the table design. In [Part 2](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-2/), we select a partition key design and create the data schema by iterating across the access patterns. Finally, in [Part 3](https://aws.amazon.com/blogs/database/amazon-dynamodb-data-modeling-for-multi-tenancy-part-3/), we validate the data model and explore how to extend the model as new access patterns emerge.
 
+### [Self-managed multi-tenant vector search with Amazon Aurora PostgreSQL](https://aws.amazon.com/blogs/database/self-managed-multi-tenant-vector-search-with-amazon-aurora-postgresql/)
+
+This blog post series explores the process of building a multi-tenant generative AI application using Aurora PostgreSQL-Compatible for vector storage. In Part 1 (this post), we present a self-managed approach to building the vector search with Aurora. 
+
+### [Multi-tenant vector search with Amazon Aurora PostgreSQL and Amazon Bedrock Knowledge Bases](https://aws.amazon.com/blogs/database/multi-tenant-vector-search-with-amazon-aurora-postgresql-and-amazon-bedrock-knowledge-bases/)
+
+This post discusses the fully managed approach using Amazon Bedrock Knowledge Bases to simplify the integration of the data source with your generative AI application using Aurora. Amazon Bedrock is a fully managed service that makes foundation models (FMs) from leading AI startups and Amazon available through an API, so you can choose from a wide range of FMs to find the model that is best suited for your use case.
+
 ### Videos :movie_camera:
 
 * [ Building SaaS on AWS - Building a modern data architecture for SaaS ](https://www.youtube.com/watch?v=KGR4SQMNsXo)
