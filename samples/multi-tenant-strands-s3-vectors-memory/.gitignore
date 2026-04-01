@@ -1,0 +1,9 @@
+blog_s3_vector_memory
+.pytest_cache
+strands_feature
+backup
+__pycache__
+.kiro
+report.html
+.venv-perf
+.env.performance
