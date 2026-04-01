@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "samples/multi-tenant-strands-s3-vectors-memory/**"
+  pull_request:
+    paths:
+      - "samples/multi-tenant-strands-s3-vectors-memory/**"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: samples/multi-tenant-strands-s3-vectors-memory
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Unit tests — no AWS credentials required, fast
+  # ---------------------------------------------------------------------------
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run unit tests
+        run: python -m pytest tests/unit/ -v
+
+  # ---------------------------------------------------------------------------
+  # Integration tests — require live AWS resources, run in a separate job
+  # (separate process = no sys.modules contamination from unit test mocks)
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    # Only run on push to main or manual dispatch — not on every PR
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run integration tests
+        env:
+          S3_VECTOR_BUCKET_NAME: ${{ secrets.S3_VECTOR_BUCKET_NAME }}
+          S3_VECTOR_TVM_ROLE_ARN: ${{ secrets.S3_VECTOR_TVM_ROLE_ARN }}
+          AWS_REGION: us-east-1
+        run: python -m pytest tests/integration/ -v
