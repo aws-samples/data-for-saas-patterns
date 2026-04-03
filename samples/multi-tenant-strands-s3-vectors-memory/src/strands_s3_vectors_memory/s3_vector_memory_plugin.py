@@ -45,9 +45,15 @@ logger = logging.getLogger(__name__)
 _MEMORY_PLACEHOLDER   = "{memory_context}"
 _MEMORY_TOP_K         = 5
 _SIMILARITY_THRESHOLD = 0.5
+# The Strands framework sets agent.name to this string when the developer does not
+# provide an explicit name. We treat it as "not set" — it is not a meaningful
+# agent identity and must not be used as a memory namespace key.
+_STRANDS_DEFAULT_AGENT_NAME = "Strands Agents"
 _SUMMARIZE_PROMPT     = (
-    "Summarize the following conversation in 500 characters or fewer. "
-    "Capture the key facts, decisions, and context. Be concise and factual.\n\n"
+    "Summarize the following conversation in 2000 characters or fewer. "
+    "Capture the key facts, decisions, and context. "
+    "Be concise and factual. "
+    "Do not use markdown formatting, headers, or bullet points — plain text only.\n\n"
 )
 _BUFFER_TTL     = 7200    # 2 hours — evict abandoned conversations
 _BUFFER_MAXSIZE = 10_000  # max concurrent conversations in-process
@@ -82,10 +88,10 @@ class S3VectorMemoryPlugin(Plugin):
             )
 
         self._cv_tenant:  contextvars.ContextVar[Optional[Dict]] = contextvars.ContextVar("tenant", default=None)
-        self._cv_user_id: contextvars.ContextVar[str]            = contextvars.ContextVar("user_id", default="")
-        self._cv_conv_id: contextvars.ContextVar[str]            = contextvars.ContextVar("conv_id", default="")
-        self._cv_has_sm:  contextvars.ContextVar[bool]           = contextvars.ContextVar("has_session_manager", default=False)
-        self._agent_name: str | None = None  # set by init_agent at wiring time
+        self._cv_user_id:    contextvars.ContextVar[str]            = contextvars.ContextVar("user_id", default="")
+        self._cv_conv_id:    contextvars.ContextVar[str]            = contextvars.ContextVar("conv_id", default="")
+        self._cv_has_sm:     contextvars.ContextVar[bool]           = contextvars.ContextVar("has_session_manager", default=False)
+        self._cv_agent_name: contextvars.ContextVar[Optional[str]]  = contextvars.ContextVar("agent_name", default=None)
         self._conv_buffer:    TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
         # Use a TTLCache instead of a plain set so entries are evicted automatically (#9)
         self._injected_convs: TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
@@ -100,17 +106,21 @@ class S3VectorMemoryPlugin(Plugin):
     # -----------------------------------------------------------------------
 
     def init_agent(self, agent: Agent) -> None:
-        """Enforce agent.name is set and store it as the memory namespace key."""
-        if not agent.name:
+        """Enforce agent.name is explicitly set at wiring time.
+
+        The Strands framework sets agent.name to 'Strands Agents' when the
+        developer does not provide a name. We treat this as unset — it is not
+        a meaningful identity and must not be used as a memory namespace key.
+        """
+        if not agent.name or agent.name == _STRANDS_DEFAULT_AGENT_NAME:
             raise ValueError(
-                "S3VectorMemoryPlugin requires agent.name to be set. "
+                "S3VectorMemoryPlugin requires agent.name to be explicitly set. "
                 "Provide a stable, unique name that identifies this agent's role:\n\n"
                 "    Agent(model=..., name='orchestrator', plugins=[plugin])\n\n"
                 "The name is used as the memory namespace — it must be consistent "
                 "across restarts so stored memories remain retrievable."
             )
-        self._agent_name = agent.name
-        logger.debug("[s3-vector-memory] init_agent: agent_name=%s", self._agent_name)
+        logger.debug("[s3-vector-memory] init_agent: agent_name=%s validated", agent.name)
 
     @hook
     def before_invocation(self, event: BeforeInvocationEvent) -> None:
@@ -178,6 +188,7 @@ class S3VectorMemoryPlugin(Plugin):
                 conv_id,
                 list(self._conv_buffer.get(conv_id, agent.messages)),
                 agent.model,
+                self._cv_agent_name.get(None),  # capture before thread boundary
             )
             # Log any exception from the background task (#8)
             future.add_done_callback(
@@ -244,7 +255,7 @@ class S3VectorMemoryPlugin(Plugin):
                     query          = query,
                     top_k          = top_k,
                     tenant_context = tenant_context,
-                    agent_name     = plugin_self._agent_name,
+                    agent_name     = plugin_self._cv_agent_name.get(None),
                 )
                 relevant = [r for r in results if r["similarity"] >= _SIMILARITY_THRESHOLD]
                 if not relevant:
@@ -278,6 +289,7 @@ class S3VectorMemoryPlugin(Plugin):
         self._cv_tenant.set(tenant_context)
         self._cv_user_id.set(user_id)
         self._cv_conv_id.set(conversation_id)
+        self._cv_agent_name.set(agent.name or None)
 
         has_sm = agent._session_manager is not None
         self._cv_has_sm.set(has_sm)
@@ -326,7 +338,7 @@ class S3VectorMemoryPlugin(Plugin):
                 query          = query,
                 top_k          = _MEMORY_TOP_K,
                 tenant_context = tenant_context,
-                agent_name     = self._agent_name,
+                agent_name     = self._cv_agent_name.get(None),
             )
             relevant = [m for m in memories if m["similarity"] >= _SIMILARITY_THRESHOLD]
             if relevant:
@@ -353,11 +365,12 @@ class S3VectorMemoryPlugin(Plugin):
         conv_id: str,
         messages: List,
         model,
+        agent_name: Optional[str] = None,
     ) -> Optional[str]:
         """Summarize and store. Safe to call from a background thread."""
         logger.debug(
-            "[s3-vector-memory] close_session_with_data: conv=%s user=%s messages=%d",
-            conv_id, user_id, len(messages),
+            "[s3-vector-memory] close_session_with_data: conv=%s user=%s agent=%s messages=%d",
+            conv_id, user_id, agent_name, len(messages),
         )
 
         if not messages:
@@ -393,9 +406,9 @@ class S3VectorMemoryPlugin(Plugin):
             )
         ).strip()
 
-        # Truncate at the last sentence boundary <= 500 chars (#12)
-        if len(summary) > 500:
-            truncated = summary[:500]
+        # Truncate at the last sentence boundary <= 2000 chars (#12)
+        if len(summary) > 2000:
+            truncated = summary[:2000]
             last_boundary = max(
                 truncated.rfind(". "),
                 truncated.rfind("! "),
@@ -414,7 +427,7 @@ class S3VectorMemoryPlugin(Plugin):
             len(summary), conv_id,
         )
 
-        key = f"{user_id}_{self._agent_name}_summary_{hashlib.sha256(conv_id.encode()).hexdigest()[:16]}"
+        key = f"{user_id}_{agent_name or 'default'}_summary_{hashlib.sha256(conv_id.encode()).hexdigest()[:16]}"
         # _embed is inside try so that the finally always clears buffers (#7)
         try:
             embedding = self._store._embed(summary, purpose="GENERIC_INDEX")
@@ -427,7 +440,7 @@ class S3VectorMemoryPlugin(Plugin):
                     "data": {"float32": [float(x) for x in embedding]},
                     "metadata": {
                         "user_id":         user_id,
-                        "agent_name":      self._agent_name,
+                        "agent_name":      agent_name or "default",
                         "content":         summary[:4096],
                         "conversation_id": conv_id,
                         "type":            "summary",
