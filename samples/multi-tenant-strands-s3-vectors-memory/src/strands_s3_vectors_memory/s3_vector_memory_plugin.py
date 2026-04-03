@@ -85,6 +85,7 @@ class S3VectorMemoryPlugin(Plugin):
         self._cv_user_id: contextvars.ContextVar[str]            = contextvars.ContextVar("user_id", default="")
         self._cv_conv_id: contextvars.ContextVar[str]            = contextvars.ContextVar("conv_id", default="")
         self._cv_has_sm:  contextvars.ContextVar[bool]           = contextvars.ContextVar("has_session_manager", default=False)
+        self._agent_name: str | None = None  # set by init_agent at wiring time
         self._conv_buffer:    TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
         # Use a TTLCache instead of a plain set so entries are evicted automatically (#9)
         self._injected_convs: TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
@@ -97,6 +98,19 @@ class S3VectorMemoryPlugin(Plugin):
     # -----------------------------------------------------------------------
     # Hook-driven lifecycle — fired automatically by Strands
     # -----------------------------------------------------------------------
+
+    def init_agent(self, agent: Agent) -> None:
+        """Enforce agent.name is set and store it as the memory namespace key."""
+        if not agent.name:
+            raise ValueError(
+                "S3VectorMemoryPlugin requires agent.name to be set. "
+                "Provide a stable, unique name that identifies this agent's role:\n\n"
+                "    Agent(model=..., name='orchestrator', plugins=[plugin])\n\n"
+                "The name is used as the memory namespace — it must be consistent "
+                "across restarts so stored memories remain retrievable."
+            )
+        self._agent_name = agent.name
+        logger.debug("[s3-vector-memory] init_agent: agent_name=%s", self._agent_name)
 
     @hook
     def before_invocation(self, event: BeforeInvocationEvent) -> None:
@@ -230,6 +244,7 @@ class S3VectorMemoryPlugin(Plugin):
                     query          = query,
                     top_k          = top_k,
                     tenant_context = tenant_context,
+                    agent_name     = plugin_self._agent_name,
                 )
                 relevant = [r for r in results if r["similarity"] >= _SIMILARITY_THRESHOLD]
                 if not relevant:
@@ -311,6 +326,7 @@ class S3VectorMemoryPlugin(Plugin):
                 query          = query,
                 top_k          = _MEMORY_TOP_K,
                 tenant_context = tenant_context,
+                agent_name     = self._agent_name,
             )
             relevant = [m for m in memories if m["similarity"] >= _SIMILARITY_THRESHOLD]
             if relevant:
@@ -398,7 +414,7 @@ class S3VectorMemoryPlugin(Plugin):
             len(summary), conv_id,
         )
 
-        key = f"{user_id}_summary_{hashlib.sha256(conv_id.encode()).hexdigest()[:16]}"
+        key = f"{user_id}_{self._agent_name}_summary_{hashlib.sha256(conv_id.encode()).hexdigest()[:16]}"
         # _embed is inside try so that the finally always clears buffers (#7)
         try:
             embedding = self._store._embed(summary, purpose="GENERIC_INDEX")
@@ -411,6 +427,7 @@ class S3VectorMemoryPlugin(Plugin):
                     "data": {"float32": [float(x) for x in embedding]},
                     "metadata": {
                         "user_id":         user_id,
+                        "agent_name":      self._agent_name,
                         "content":         summary[:4096],
                         "conversation_id": conv_id,
                         "type":            "summary",

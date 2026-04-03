@@ -64,7 +64,8 @@ class S3VectorMemory:
         return self._s3vectors
 
     def store_memory(self, user_id: str, content: str,
-                     tenant_context: Optional[Dict] = None) -> Dict:
+                     tenant_context: Optional[Dict] = None,
+                     agent_name: Optional[str] = None) -> Dict:
         """Embed content and put_vectors to the index."""
         index_name = self._build_index_name(tenant_context)
         logger.debug(
@@ -89,9 +90,10 @@ class S3VectorMemory:
                 "key":  key,
                 "data": {"float32": [float(x) for x in embedding]},
                 "metadata": {
-                    "user_id":   user_id,
-                    "content":   safe_content,
-                    "stored_at": timestamp,
+                    "user_id":    user_id,
+                    "agent_name": agent_name or "default",
+                    "content":    safe_content,
+                    "stored_at":  timestamp,
                 },
             }],
         )
@@ -102,27 +104,35 @@ class S3VectorMemory:
         return {"status": "success", "index_name": index_name, "key": key}
 
     def retrieve_memories(self, user_id: str, query: str, top_k: int = 5,
-                          tenant_context: Optional[Dict] = None) -> List[Dict]:
-        """query_vectors from the index filtered by user_id."""
+                          tenant_context: Optional[Dict] = None,
+                          agent_name: Optional[str] = None) -> List[Dict]:
+        """query_vectors from the index filtered by user_id and optionally agent_name."""
         if not query or not query.strip():  # guard for empty query (#3)
             logger.debug("[s3-vector-memory] retrieve_memories: empty query, returning []")
             return []
 
         index_name = self._build_index_name(tenant_context)
         logger.debug(
-            "[s3-vector-memory] retrieve_memories: user=%s index=%s query_len=%d top_k=%d",
-            user_id, index_name, len(query), top_k,
+            "[s3-vector-memory] retrieve_memories: user=%s index=%s query_len=%d top_k=%d agent=%s",
+            user_id, index_name, len(query), top_k, agent_name,
         )
 
         query_embedding = self._embed(query, purpose="GENERIC_RETRIEVAL")
         client          = self._get_s3vectors_client(tenant_context)
+
+        # Build filter — agent_name=None means no agent scoping (cross-agent access).
+        # S3 Vectors requires $and for compound filters; single-key filters use plain dict.
+        if agent_name is not None:
+            vector_filter: Dict = {"$and": [{"user_id": user_id}, {"agent_name": agent_name}]}
+        else:
+            vector_filter = {"user_id": user_id}
 
         response = client.query_vectors(
             vectorBucketName=self.bucket_name,
             indexName=index_name,
             queryVector={"float32": query_embedding},
             topK=top_k,
-            filter={"user_id": user_id},
+            filter=vector_filter,
             returnDistance=True,
             returnMetadata=True,
         )

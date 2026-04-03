@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "strands-s3-vectors-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Long-term semantic memory plugin for Strands Agents backed by Amazon S3 Vectors"
 readme = "README.md"
 license = { text = "MIT" }
