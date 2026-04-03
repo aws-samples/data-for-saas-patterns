@@ -9,6 +9,7 @@ Requires:
 """
 
 import os
+import time
 
 import pytest
 from botocore.exceptions import ClientError
@@ -102,6 +103,63 @@ class TestMultiTenantStoreRetrieve:
         """Req 3.4: _build_index_name({}) raises ValueError when tenantId is absent."""
         with pytest.raises(ValueError):
             self.mem._build_index_name({})
+
+
+class TestMultiAgentIsolation:
+    """Multi-agent memory isolation tests."""
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tenant_a_index):
+        self.store = MultiTenantS3VectorMemory(
+            bucket_name=BUCKET_NAME,
+            region_name=AWS_REGION,
+            embedding_model=EMBEDDING_MODEL_ID,
+            tvm_role_arn=TVM_ROLE_ARN,
+        )
+        self.tenant_a = {"tenantId": f"tenant-a-{RUN_ID}"}
+        self.user_id = f"user_{RUN_ID}_ma"
+
+    def test_orchestrator_memory_not_visible_to_researcher(self):
+        """Memories stored by orchestrator are not retrieved by researcher."""
+        self.store.store_memory(
+            self.user_id, "orchestrator decision: use Python",
+            tenant_context=self.tenant_a, agent_name="orchestrator",
+        )
+        time.sleep(3)
+
+        results = self.store.retrieve_memories(
+            self.user_id, "programming language decision",
+            tenant_context=self.tenant_a, agent_name="researcher",
+        )
+        assert results == []
+
+    def test_researcher_retrieves_own_memories(self):
+        """Researcher retrieves only its own stored memories."""
+        self.store.store_memory(
+            self.user_id, "research finding: Python is fastest",
+            tenant_context=self.tenant_a, agent_name="researcher",
+        )
+        time.sleep(3)
+
+        results = self.store.retrieve_memories(
+            self.user_id, "research finding",
+            tenant_context=self.tenant_a, agent_name="researcher",
+        )
+        assert len(results) > 0
+
+    def test_cross_agent_access_with_no_agent_name_filter(self):
+        """Passing agent_name=None retrieves memories from all agents."""
+        self.store.store_memory(
+            self.user_id, "shared context: project deadline Friday",
+            tenant_context=self.tenant_a, agent_name="orchestrator",
+        )
+        time.sleep(3)
+
+        results = self.store.retrieve_memories(
+            self.user_id, "project deadline",
+            tenant_context=self.tenant_a, agent_name=None,
+        )
+        assert len(results) > 0
 
 
 class TestTVMCredentialScoping:

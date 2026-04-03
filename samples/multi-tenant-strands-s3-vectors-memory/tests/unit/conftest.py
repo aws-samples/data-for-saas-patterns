@@ -78,4 +78,5 @@ def mock_strands_agent():
     agent._session_manager = None
     agent.messages = []
     agent.system_prompt = ""
+    agent.name = "test-agent"   # required by init_agent
     return agent

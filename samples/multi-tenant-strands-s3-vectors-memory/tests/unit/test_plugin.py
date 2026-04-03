@@ -155,6 +155,38 @@ class TestPluginConstruction:
 
 
 # ---------------------------------------------------------------------------
+# TestInitAgent — enforce agent.name at wiring time
+# ---------------------------------------------------------------------------
+
+
+class TestInitAgent:
+
+    def test_init_agent_stores_agent_name(self):
+        """init_agent stores agent.name as _agent_name."""
+        plugin, _ = _make_plugin()
+        agent = MagicMock()
+        agent.name = "orchestrator"
+        plugin.init_agent(agent)
+        assert plugin._agent_name == "orchestrator"
+
+    def test_init_agent_raises_when_name_not_set(self):
+        """init_agent raises ValueError when agent.name is None."""
+        plugin, _ = _make_plugin()
+        agent = MagicMock()
+        agent.name = None
+        with pytest.raises(ValueError, match="agent.name"):
+            plugin.init_agent(agent)
+
+    def test_init_agent_raises_when_name_empty_string(self):
+        """init_agent raises ValueError when agent.name is empty string."""
+        plugin, _ = _make_plugin()
+        agent = MagicMock()
+        agent.name = ""
+        with pytest.raises(ValueError, match="agent.name"):
+            plugin.init_agent(agent)
+
+
+# ---------------------------------------------------------------------------
 # Task 6.2 — TestBeforeInvocationFirstTurn
 # Requirements: 11.1, 11.2, 11.3, 11.4, 11.5, 11.6
 # ---------------------------------------------------------------------------
@@ -467,6 +499,40 @@ class TestCloseSessionWithData:
         call_kwargs = mock_client.put_vectors.call_args[1]
         stored_content = call_kwargs["vectors"][0]["metadata"]["content"]
         assert len(stored_content) <= 500
+
+    def test_summary_key_includes_agent_name(self):
+        """Summary key format is {user_id}_{agent_name}_summary_{hash}."""
+        plugin, store = _make_plugin()
+        plugin._agent_name = "researcher"
+        messages = [{"role": "user", "content": [{"text": "Important fact"}]}]
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.return_value = "Summary of conversation."
+        mock_agent_cls = MagicMock(return_value=mock_agent_instance)
+        mock_client = MagicMock()
+        store._get_s3vectors_client.return_value = mock_client
+
+        with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
+            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
+
+        key = mock_client.put_vectors.call_args[1]["vectors"][0]["key"]
+        assert "researcher" in key
+
+    def test_summary_metadata_includes_agent_name(self):
+        """Stored metadata contains agent_name field."""
+        plugin, store = _make_plugin()
+        plugin._agent_name = "researcher"
+        messages = [{"role": "user", "content": [{"text": "Important fact"}]}]
+        mock_agent_instance = MagicMock()
+        mock_agent_instance.return_value = "Summary of conversation."
+        mock_agent_cls = MagicMock(return_value=mock_agent_instance)
+        mock_client = MagicMock()
+        store._get_s3vectors_client.return_value = mock_client
+
+        with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
+            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
+
+        metadata = mock_client.put_vectors.call_args[1]["vectors"][0]["metadata"]
+        assert metadata["agent_name"] == "researcher"
 
     def test_cleanup_removes_conv_from_buffer_and_injected_convs(self):
         """conv_id and _prompt_{conv_id} removed from _conv_buffer; conv_id discarded from _injected_convs."""
