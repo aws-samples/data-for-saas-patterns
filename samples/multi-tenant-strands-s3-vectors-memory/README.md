@@ -118,7 +118,7 @@ aws s3vectors create-index \
   --data-type float32 \
   --dimension 1024 \
   --distance-metric cosine \
-  --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+  --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
   --region $AWS_REGION
 ```
 
@@ -132,7 +132,7 @@ for TENANT in tenant-001 tenant-002; do
     --data-type float32 \
     --dimension 1024 \
     --distance-metric cosine \
-    --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+    --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
     --region $AWS_REGION
 done
 ```
@@ -181,6 +181,45 @@ agent("What do you know about my preferences?", invocation_state={
 ```
 
 `BASE_PROMPT` must contain a `{memory_context}` placeholder. The plugin fills it with retrieved conversation summaries on the first turn of each conversation, or replaces it with an empty string when no relevant memories are found.
+
+### Multi-agent usage
+
+When multiple agents share the same memory store, each agent must have a unique `name` set at construction time. The plugin enforces this at wiring time — if `agent.name` is not set, `Agent(plugins=[plugin])` raises `ValueError`.
+
+The `name` is used as the memory namespace key. It must be stable across process restarts so stored memories remain retrievable.
+
+```python
+store  = MultiTenantS3VectorMemory(bucket_name=..., tvm_role_arn=...)
+plugin = S3VectorMemoryPlugin(store=store, base_prompt=BASE_PROMPT)
+
+orchestrator = Agent(
+    model         = BedrockModel(),
+    name          = "orchestrator",   # required — unique per agent role
+    plugins       = [plugin],
+    system_prompt = BASE_PROMPT,
+)
+researcher = Agent(
+    model         = BedrockModel(),
+    name          = "researcher",
+    plugins       = [plugin],
+    system_prompt = BASE_PROMPT,
+)
+```
+
+Each agent retrieves only its own memories by default. To retrieve memories across all agents for a user (e.g. a supervisor agent), call the store directly with `agent_name=None`:
+
+```python
+all_memories = store.retrieve_memories(
+    user_id        = "user-456",
+    query          = "what has been decided so far?",
+    tenant_context = tenant_context,
+    agent_name     = None,   # no agent filter — returns all agents' memories
+)
+```
+
+See `examples/multi_agent_orchestrator.py` for a runnable end-to-end example.
+
+---
 
 ### Multi-tenant
 
@@ -279,7 +318,7 @@ aws s3vectors create-index \
   --vector-bucket-name $S3_VECTOR_BUCKET_NAME \
   --index-name memory \
   --data-type float32 --dimension 1024 --distance-metric cosine \
-  --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+  --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
   --region $AWS_REGION
 ```
 
@@ -340,7 +379,7 @@ for TENANT in tenant-001 tenant-002; do
     --vector-bucket-name $S3_VECTOR_BUCKET_NAME \
     --index-name memory-${TENANT} \
     --data-type float32 --dimension 1024 --distance-metric cosine \
-    --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+    --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
     --region $AWS_REGION
 done
 ```

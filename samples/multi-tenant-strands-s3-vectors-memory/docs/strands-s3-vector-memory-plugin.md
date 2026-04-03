@@ -66,7 +66,7 @@ aws s3vectors create-index \
   --data-type float32 \
   --dimension 1024 \
   --distance-metric cosine \
-  --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+  --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
   --region $AWS_REGION
 ```
 
@@ -80,7 +80,7 @@ for TENANT in tenant-001 tenant-002; do
     --data-type float32 \
     --dimension 1024 \
     --distance-metric cosine \
-    --metadata-configuration '{"nonFilterableMetadataKeys":["content","conversation_id","type"]}' \
+    --metadata-configuration '{"nonFilterableMetadataKeys":["content","stored_at","conversation_id","type"]}' \
     --region $AWS_REGION
 done
 ```
@@ -527,6 +527,85 @@ Calls `STS AssumeRole` with a `TenantID` session tag and caches credentials per 
 | Background summarization | Non-blocking thread | Summarization involves two Bedrock calls (~2–4s). Offloading keeps the agent response latency unaffected. |
 | TVM credential caching | `boto3.Session` cached 12 min per tenant | 3-minute buffer before 15-minute STS expiry. On failure, `None` sentinel cached to prevent thundering-herd retries. |
 | Explicit memory access from Agent | Retrieve-only mid-turn via `memory_tool`; store via plugin lifecycle | Exposing a store tool to the agent mid-turn would let the LLM decide what and when to store, producing inconsistent, noisy memories. Retrieval mid-turn is safe and useful — the agent can query prior context on demand via `plugin.memory_tool`. Storage is reserved for the plugin's `end_session` path, which always stores a structured LLM-generated summary of the full conversation, not arbitrary fragments chosen by the model. |
+| Multi-agent memory scoping | `agent.name` as mandatory second dimension | In a multi-agent system, scoping by `user_id` alone causes summary key collisions and retrieval cross-contamination. `agent.name` is enforced at wiring time via `init_agent` — if unset, construction raises `ValueError`. This makes the namespace explicit and stable across restarts. |
+| Multi-agent default isolation | Each agent retrieves only its own memories | Safe default — an orchestrator does not accidentally inject a researcher's memories into its own context. Cross-agent access is opt-in via `store.retrieve_memories(agent_name=None)`. |
+| Multi-agent summary key | `{user_id}_{agent_name}_summary_{hash}` | Including `agent_name` in the key prevents two agents with the same `conversation_id` from silently overwriting each other's summaries. |
+| Multi-agent compound filter | `$and` operator for `user_id` + `agent_name` | S3 Vectors does not support multi-key shorthand filters — compound filters require the `$and` operator. Single-key filters (cross-agent access with `agent_name=None`) use the plain `{"user_id": ...}` form. |
+| Cross-agent access constraints | Same tenant + same user only, read-only | Cross-agent access is scoped by the TVM IAM boundary (same tenant) and the `user_id` filter (same user). There is no way to write to another agent's namespace — `store_memory` always requires `agent_name`. |
+
+## Multi-agent memory isolation
+
+In a multi-agent system (orchestrator + sub-agents), multiple agents may write and retrieve memories for the same `user_id`. Without scoping, agents overwrite each other's summaries and retrieve irrelevant context from other agents.
+
+### Why `agent.name` is mandatory
+
+`S3VectorMemoryPlugin` calls `init_agent(agent)` when `Agent(plugins=[plugin])` is constructed. If `agent.name` is not set or is an empty string, it raises `ValueError` immediately:
+
+```python
+# Raises ValueError — agent.name is required
+agent = Agent(model=BedrockModel(), plugins=[plugin])
+
+# Correct — name is set
+agent = Agent(model=BedrockModel(), name="orchestrator", plugins=[plugin])
+```
+
+The name is used as the memory namespace key. It must be stable across process restarts — changing it means old memories are no longer retrieved.
+
+### `agent_name` metadata field and filter
+
+Every vector stored by the plugin includes `agent_name` in its metadata:
+
+```
+Vector metadata:
+  user_id:    "user-456"       ← filterable, user scoping
+  agent_name: "researcher"     ← filterable, agent scoping
+  content:    "..."            ← non-filterable
+  stored_at:  "20250101_..."   ← non-filterable
+```
+
+On retrieval, the filter is scoped to both `user_id` and `agent_name`:
+
+```python
+# Each agent only retrieves its own memories
+filter = {"$and": [{"user_id": user_id}, {"agent_name": "researcher"}]}
+```
+
+### Summary key format
+
+The summary key now includes `agent_name` to prevent key collisions between agents sharing the same `conversation_id`:
+
+```
+{user_id}_{agent_name}_summary_{conv_hash[:16]}
+```
+
+### Cross-agent access pattern
+
+To retrieve memories across all agents for a user (e.g. a supervisor synthesising results), call the store directly with `agent_name=None`:
+
+```python
+all_memories = store.retrieve_memories(
+    user_id        = user_id,
+    query          = "what has each agent found?",
+    tenant_context = tenant_context,
+    agent_name     = None,   # no agent filter — returns all agents' memories
+)
+```
+
+The plugin never does cross-agent retrieval automatically. It is always opt-in via direct store calls.
+
+### Migration note for existing deployments
+
+Existing vectors written before `0.2.0` do not have `agent_name` in their metadata. They will not be returned by the new agent-scoped filter. To backfill:
+
+```bash
+export S3_VECTOR_BUCKET_NAME=my-bucket
+export AWS_REGION=us-east-1
+python scripts/backfill_agent_name.py --tenant-id tenant-001 --agent-name default
+```
+
+The script pages through all vectors in the index using `list_vectors`, identifies those without `agent_name`, and re-writes them with `put_vectors` adding `agent_name="default"`.
+
+---
 
 ## Testing
 
