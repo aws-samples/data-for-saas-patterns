@@ -31,6 +31,7 @@ _plugin = S3VectorMemoryPlugin(store=_store, base_prompt=BASE_PROMPT)
 _agent  = Agent(
     model            = BedrockModel(model_id=os.environ.get("BEDROCK_MODEL_ID",
                                    "us.anthropic.claude-sonnet-4-5-20250929-v1:0")),
+    name             = "assistant",
     system_prompt    = BASE_PROMPT,
     tools            = [_plugin.memory_tool],  # mid-turn recall on demand
     plugins          = [_plugin],

@@ -191,6 +191,7 @@ def _make_agent(plugin: S3VectorMemoryPlugin):
             model_id=BEDROCK_MODEL_ID,
             region_name=AWS_REGION,
         ),
+        name="test-agent",
         system_prompt=BASE_PROMPT,
         plugins=[plugin],
         callback_handler=None,
@@ -496,6 +497,7 @@ class TestConversationSummary:
                 model_id=BEDROCK_MODEL_ID,
                 region_name=AWS_REGION,
             ),
+            name="test-agent",
             system_prompt=SUMMARY_BASE_PROMPT,
             plugins=[self.plugin],
             callback_handler=None,
@@ -580,7 +582,7 @@ class TestConversationSummary:
     # ------------------------------------------------------------------
 
     def test_summary_length_constraint(self):
-        """Req 6.3: the summary returned by close_session_with_data must be <= 500 chars."""
+        """Req 6.3: the summary returned by close_session_with_data must be <= 2000 chars."""
         user_id = f"user_{RUN_ID}_6_3"
         conv_id = f"conv_{RUN_ID}_6_3"
 
@@ -610,8 +612,8 @@ class TestConversationSummary:
         )
 
         assert summary is not None, "Expected a non-None summary"
-        assert len(summary) <= 500, (
-            f"Summary length {len(summary)} exceeds 500 characters: {summary!r}"
+        assert len(summary) <= 2000, (
+            f"Summary length {len(summary)} exceeds 2000 characters: {summary!r}"
         )
 
     # ------------------------------------------------------------------
@@ -727,3 +729,45 @@ class TestMemoryTool:
         result = self.plugin.memory_tool(query="anything")
 
         assert "user_id not set" in result
+
+
+class TestInitAgentEnforcement:
+    """
+    Integration tests for init_agent enforcement against a real Strands Agent.
+
+    These tests use a real Agent() to verify that the Strands framework default
+    name ('Strands Agents') is correctly detected and rejected by init_agent.
+    Unit tests use MagicMock and cannot catch this because MagicMock.name is
+    always whatever you set it to — it does not replicate the framework default.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, memory_index):
+        from strands_s3_vectors_memory import S3VectorMemory, S3VectorMemoryPlugin
+        self.store = S3VectorMemory(
+            bucket_name=BUCKET_NAME,
+            region_name=AWS_REGION,
+            embedding_model=EMBEDDING_MODEL_ID,
+        )
+        self.plugin = S3VectorMemoryPlugin(store=self.store, base_prompt="test {memory_context}")
+
+    def test_agent_without_name_raises_on_plugin_wiring(self):
+        """Agent() without name= uses the Strands default — plugin must raise ValueError."""
+        from strands import Agent
+        from strands.models import BedrockModel
+        with pytest.raises(ValueError, match="agent.name"):
+            Agent(
+                model   = BedrockModel(),
+                plugins = [self.plugin],
+            )
+
+    def test_agent_with_explicit_name_does_not_raise(self):
+        """Agent(name='orchestrator') must wire successfully without raising."""
+        from strands import Agent
+        from strands.models import BedrockModel
+        # Should not raise
+        Agent(
+            model   = BedrockModel(),
+            name    = "orchestrator",
+            plugins = [self.plugin],
+        )

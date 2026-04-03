@@ -81,12 +81,15 @@ def _turn(agent, agent_label, message, conv_id, end_session=False):
 
 
 if __name__ == "__main__":
+    # -----------------------------------------------------------------------
+    # STEP 1 — orchestrator stores a budget decision (finance domain)
+    # -----------------------------------------------------------------------
     print("=" * 60)
-    print("STEP 1 — orchestrator stores a decision")
+    print("STEP 1 — orchestrator stores a budget decision")
     print("=" * 60)
 
     _turn(orchestrator, "orchestrator",
-          "We have decided to use Python for the backend.",
+          "The Q4 budget has been approved at $2M. This is confidential.",
           conv_id="orch-conv-001")
     _turn(orchestrator, "orchestrator",
           "Got it, thanks.",
@@ -95,12 +98,16 @@ if __name__ == "__main__":
     print("\n[waiting 5s for background summary store to complete...]")
     time.sleep(5)
 
+    # -----------------------------------------------------------------------
+    # STEP 2 — researcher stores a finding about a completely different topic
+    # (marine biology — no semantic overlap with budget/finance)
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 2 — researcher stores a finding")
+    print("STEP 2 — researcher stores an unrelated finding (marine biology)")
     print("=" * 60)
 
     _turn(researcher, "researcher",
-          "Research finding: Python has the best library ecosystem for our use case.",
+          "Research finding: coral reef bleaching has accelerated by 40% since 2020.",
           conv_id="res-conv-001")
     _turn(researcher, "researcher",
           "Thanks, wrapping up.",
@@ -109,35 +116,48 @@ if __name__ == "__main__":
     print("\n[waiting 5s for background summary store to complete...]")
     time.sleep(5)
 
+    # -----------------------------------------------------------------------
+    # STEP 3 — isolation check: researcher queries about the budget
+    # It has NO memory of the orchestrator's budget decision.
+    # Expected: agent says it has no information about a budget.
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 3 — isolation check: researcher cannot see orchestrator's memories")
-    print("  Expected: researcher has NO memory of the Python decision.")
+    print("STEP 3 — isolation check: researcher queries the budget decision")
+    print("  Expected: researcher has NO memory of the $2M budget.")
+    print("  If it mentions '$2M' or 'Q4 budget', isolation has FAILED.")
     print("=" * 60)
 
     _turn(researcher, "researcher",
-          "What programming language decision was made?",
+          "What budget was approved for Q4?",
           conv_id="res-conv-002")
 
-    print("\n  👆 Researcher should not know about the orchestrator's Python decision.")
-    print("     If it mentions 'Python backend decision', isolation has failed.")
+    print("\n  👆 Researcher should say it has no information about a Q4 budget.")
 
+    # -----------------------------------------------------------------------
+    # STEP 4 — orchestrator recalls its own budget decision
+    # Expected: orchestrator remembers the $2M budget.
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
-    print("STEP 4 — orchestrator recalls its own memory")
-    print("  Expected: orchestrator remembers the Python decision.")
+    print("STEP 4 — orchestrator recalls its own budget decision")
+    print("  Expected: orchestrator remembers the $2M Q4 budget.")
     print("=" * 60)
 
     _turn(orchestrator, "orchestrator",
-          "What was the backend language decision we made?",
+          "What budget was approved for Q4?",
           conv_id="orch-conv-002")
 
+    # -----------------------------------------------------------------------
+    # STEP 5 — cross-agent access: supervisor reads all memories
+    # -----------------------------------------------------------------------
     print("\n" + "=" * 60)
     print("STEP 5 — cross-agent access: supervisor reads all memories")
     print("  Calling store.retrieve_memories with agent_name=None.")
+    print("  Expected: returns memories from BOTH orchestrator and researcher.")
     print("=" * 60)
 
     all_memories = store.retrieve_memories(
         user_id        = USER_ID,
-        query          = "Python programming language",
+        query          = "Q4 budget approval",
         tenant_context = TENANT_CONTEXT,
         agent_name     = None,   # no agent filter — returns all agents' memories
     )

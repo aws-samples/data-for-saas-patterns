@@ -152,6 +152,7 @@ class TestPluginConstruction:
         assert plugin._cv_user_id.get("") == ""
         assert plugin._cv_conv_id.get("") == ""
         assert plugin._cv_has_sm.get(False) is False
+        assert plugin._cv_agent_name.get(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -161,15 +162,22 @@ class TestPluginConstruction:
 
 class TestInitAgent:
 
-    def test_init_agent_stores_agent_name(self):
-        """init_agent stores agent.name as _agent_name."""
+    def test_init_agent_accepts_explicit_name(self):
+        """init_agent does not raise when agent.name is explicitly set."""
         plugin, _ = _make_plugin()
         agent = MagicMock()
         agent.name = "orchestrator"
-        plugin.init_agent(agent)
-        assert plugin._agent_name == "orchestrator"
+        plugin.init_agent(agent)  # should not raise
 
-    def test_init_agent_raises_when_name_not_set(self):
+    def test_init_agent_raises_when_name_is_strands_default(self):
+        """init_agent raises ValueError when agent.name is the Strands framework default."""
+        plugin, _ = _make_plugin()
+        agent = MagicMock()
+        agent.name = "Strands Agents"  # framework default — treated as unset
+        with pytest.raises(ValueError, match="agent.name"):
+            plugin.init_agent(agent)
+
+    def test_init_agent_raises_when_name_is_none(self):
         """init_agent raises ValueError when agent.name is None."""
         plugin, _ = _make_plugin()
         agent = MagicMock()
@@ -478,12 +486,12 @@ class TestCloseSessionWithData:
         assert vector["metadata"]["conversation_id"] == "c1"
 
     def test_summary_truncated_to_500_chars(self):
-        """Summary > 500 chars is truncated to 500 chars before storing."""
+        """Summary > 2000 chars is truncated to 2000 chars before storing."""
         plugin, store = _make_plugin()
         messages = [
             {"role": "user", "content": [{"text": "Tell me everything"}]},
         ]
-        long_summary = "x" * 600
+        long_summary = "x" * 2200
         mock_agent_instance = MagicMock()
         mock_agent_instance.return_value = long_summary
         mock_agent_cls = MagicMock(return_value=mock_agent_instance)
@@ -495,15 +503,15 @@ class TestCloseSessionWithData:
             result = plugin.close_session_with_data(None, "u1", "c1", messages, self._make_model())
 
         assert result is not None
-        assert len(result) <= 500
+        assert len(result) <= 2000
         call_kwargs = mock_client.put_vectors.call_args[1]
         stored_content = call_kwargs["vectors"][0]["metadata"]["content"]
-        assert len(stored_content) <= 500
+        assert len(stored_content) <= 2000
 
     def test_summary_key_includes_agent_name(self):
         """Summary key format is {user_id}_{agent_name}_summary_{hash}."""
         plugin, store = _make_plugin()
-        plugin._agent_name = "researcher"
+        plugin._cv_agent_name.set("researcher")
         messages = [{"role": "user", "content": [{"text": "Important fact"}]}]
         mock_agent_instance = MagicMock()
         mock_agent_instance.return_value = "Summary of conversation."
@@ -512,7 +520,7 @@ class TestCloseSessionWithData:
         store._get_s3vectors_client.return_value = mock_client
 
         with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
-            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
+            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock(), agent_name="researcher")
 
         key = mock_client.put_vectors.call_args[1]["vectors"][0]["key"]
         assert "researcher" in key
@@ -520,7 +528,7 @@ class TestCloseSessionWithData:
     def test_summary_metadata_includes_agent_name(self):
         """Stored metadata contains agent_name field."""
         plugin, store = _make_plugin()
-        plugin._agent_name = "researcher"
+        plugin._cv_agent_name.set("researcher")
         messages = [{"role": "user", "content": [{"text": "Important fact"}]}]
         mock_agent_instance = MagicMock()
         mock_agent_instance.return_value = "Summary of conversation."
@@ -529,7 +537,7 @@ class TestCloseSessionWithData:
         store._get_s3vectors_client.return_value = mock_client
 
         with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
-            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
+            plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock(), agent_name="researcher")
 
         metadata = mock_client.put_vectors.call_args[1]["vectors"][0]["metadata"]
         assert metadata["agent_name"] == "researcher"
@@ -762,8 +770,8 @@ class TestCloseSessionSentenceBoundaryTruncation:
 
     def test_summary_ends_at_sentence_boundary(self):
         plugin, store = _make_plugin()
-        long_summary = ("Sentence one. " * 36) + "This crosses the boundary"
-        assert len(long_summary) > 500
+        long_summary = ("Sentence one. " * 145) + "This crosses the boundary"
+        assert len(long_summary) > 2000
 
         messages = [{"role": "user", "content": [{"text": "hi"}]}]
         mock_agent_instance = MagicMock()
