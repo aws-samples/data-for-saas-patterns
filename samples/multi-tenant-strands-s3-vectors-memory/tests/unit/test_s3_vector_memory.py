@@ -162,6 +162,18 @@ class TestS3VectorMemoryStoreMemory:
         result = self.store.store_memory("alice", "some content")
         assert result["key"].startswith("alice_")
 
+    def test_store_memory_metadata_includes_agent_name(self):
+        """store_memory includes agent_name in metadata when provided."""
+        self.store.store_memory("user1", "content", agent_name="orchestrator")
+        metadata = self.mock_s3v.put_vectors.call_args[1]["vectors"][0]["metadata"]
+        assert metadata["agent_name"] == "orchestrator"
+
+    def test_store_memory_metadata_agent_name_defaults_to_default(self):
+        """store_memory uses 'default' when agent_name is not provided."""
+        self.store.store_memory("user1", "content")
+        metadata = self.mock_s3v.put_vectors.call_args[1]["vectors"][0]["metadata"]
+        assert metadata["agent_name"] == "default"
+
 
 # ---------------------------------------------------------------------------
 # Task 2.4 — TestS3VectorMemoryRetrieveMemories
@@ -258,6 +270,18 @@ class TestS3VectorMemoryRetrieveMemories:
         assert r["content"] == "test content"
         assert r["stored_at"] == "20250101_120000"
         assert "similarity" in r
+
+    def test_retrieve_memories_filter_includes_agent_name_when_provided(self):
+        """query_vectors filter uses $and when agent_name is provided."""
+        self.store.retrieve_memories("user1", "query", agent_name="researcher")
+        call_kwargs = self.mock_s3v.query_vectors.call_args[1]
+        assert call_kwargs["filter"] == {"$and": [{"user_id": "user1"}, {"agent_name": "researcher"}]}
+
+    def test_retrieve_memories_filter_excludes_agent_name_when_none(self):
+        """query_vectors filter does not include agent_name when None (cross-agent access)."""
+        self.store.retrieve_memories("user1", "query", agent_name=None)
+        call_kwargs = self.mock_s3v.query_vectors.call_args[1]
+        assert call_kwargs["filter"] == {"user_id": "user1"}
 
 
 # ---------------------------------------------------------------------------

@@ -44,7 +44,7 @@ def _create_index(client, bucket: str, name: str) -> None:
             dimension=1024,
             distanceMetric="cosine",
             metadataConfiguration={
-                "nonFilterableMetadataKeys": ["content", "conversation_id", "type"]
+                "nonFilterableMetadataKeys": ["content", "stored_at", "conversation_id", "type"]
             },
         )
     except client.exceptions.ConflictException:
