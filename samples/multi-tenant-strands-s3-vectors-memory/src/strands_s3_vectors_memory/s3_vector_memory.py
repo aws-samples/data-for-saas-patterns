@@ -50,6 +50,9 @@ class S3VectorMemory:
         self.region_name     = region_name
         self.embedding_model = embedding_model
         self._s3vectors      = boto3.client("s3vectors", region_name=region_name)
+        # Reuse a single bedrock-runtime client — boto3 clients are thread-safe for reads
+        # and creating one per _embed call adds unnecessary latency.
+        self._bedrock        = boto3.client("bedrock-runtime", region_name=region_name)
         logger.debug(
             "[s3-vector-memory] S3VectorMemory init: bucket=%s region=%s model=%s",
             bucket_name, region_name, embedding_model,
@@ -88,7 +91,7 @@ class S3VectorMemory:
             indexName=index_name,
             vectors=[{
                 "key":  key,
-                "data": {"float32": [float(x) for x in embedding]},
+                "data": {"float32": embedding},
                 "metadata": {
                     "user_id":    user_id,
                     "agent_name": agent_name or "default",
@@ -157,7 +160,7 @@ class S3VectorMemory:
 
     def _embed(self, text: str, purpose: str = "GENERIC_INDEX") -> List[float]:
         """Call Amazon Nova Multimodal Embeddings and return the embedding vector.
-        Creates a new boto3 client per call — boto3 clients are not thread-safe."""
+        Reuses the shared bedrock-runtime client created at construction time."""
         logger.debug(
             "[s3-vector-memory] _embed: purpose=%s text_len=%d",
             purpose, len(text),
@@ -170,8 +173,7 @@ class S3VectorMemory:
                 "text": {"truncationMode": "END", "value": text},
             },
         }
-        client = boto3.client("bedrock-runtime", region_name=self.region_name)
-        response = client.invoke_model(
+        response = self._bedrock.invoke_model(
             modelId=self.embedding_model, body=json.dumps(body), contentType="application/json"
         )
         embedding = json.loads(response["body"].read())["embeddings"][0]["embedding"]
