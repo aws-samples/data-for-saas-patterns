@@ -49,7 +49,6 @@ sys.modules.setdefault("strands.models", MagicMock())
 # ---------------------------------------------------------------------------
 
 import pytest
-from cachetools import TTLCache
 
 import strands_s3_vectors_memory.s3_vector_memory_plugin as plugin_module
 from strands_s3_vectors_memory.s3_vector_memory_plugin import S3VectorMemoryPlugin
@@ -81,8 +80,12 @@ def _make_plugin(base_prompt=BASE_PROMPT_WITH_PLACEHOLDER, memories=None):
 
 
 def _make_before_event(user_id="u1", conversation_id="c1", messages=None,
-                       has_session_manager=False):
-    """Build a BeforeInvocationEvent-like mock."""
+                       has_session_manager=True):
+    """Build a BeforeInvocationEvent-like mock.
+
+    has_session_manager defaults to True because the plugin now requires a
+    SessionManager and raises RuntimeError when it is absent.
+    """
     event = MagicMock()
     event.invocation_state = {
         "user_id": user_id,
@@ -133,25 +136,12 @@ class TestPluginConstruction:
             _make_plugin(base_prompt=BASE_PROMPT_NO_PLACEHOLDER)
         assert any(r.levelname == "WARNING" for r in caplog.records)
 
-    def test_conv_buffer_is_ttlcache(self):
-        """_conv_buffer is a TTLCache instance."""
-        plugin, _ = _make_plugin()
-        assert isinstance(plugin._conv_buffer, TTLCache)
-
-    def test_injected_convs_is_empty_set(self):
-        """_injected_convs is an empty bounded TTLCache at construction."""
-        plugin, _ = _make_plugin()
-        from cachetools import TTLCache
-        assert isinstance(plugin._injected_convs, TTLCache)
-        assert len(plugin._injected_convs) == 0
-
     def test_contextvars_at_defaults(self):
         """All ContextVars are at their default values after construction."""
         plugin, _ = _make_plugin()
         assert plugin._cv_tenant.get(None) is None
         assert plugin._cv_user_id.get("") == ""
         assert plugin._cv_conv_id.get("") == ""
-        assert plugin._cv_has_sm.get(False) is False
         assert plugin._cv_agent_name.get(None) is None
 
 
@@ -240,11 +230,14 @@ class TestBeforeInvocationFirstTurn:
         assert prompt == prompt.strip()
 
     def test_conversation_id_added_to_injected_convs(self):
-        """conversation_id is added to _injected_convs after first turn."""
+        """conversation_id is tracked after first turn (agent.messages starts empty)."""
         plugin, store = _make_plugin()
         event = _make_before_event(conversation_id="conv-123")
+        # First turn: agent.messages is empty
+        event.agent.messages = []
         plugin.before_invocation(event)
-        assert "conv-123" in plugin._injected_convs
+        # retrieve_memories was called — confirms first-turn path executed
+        store.retrieve_memories.assert_called_once()
 
     def test_missing_user_id_returns_immediately(self):
         """Missing user_id in invocation_state → returns without modifying agent."""
@@ -260,6 +253,15 @@ class TestBeforeInvocationFirstTurn:
         store.retrieve_memories.assert_not_called()
         # system_prompt should not have been set by the plugin
         event.agent.system_prompt = BASE_PROMPT_WITH_PLACEHOLDER  # unchanged
+
+    def test_no_session_manager_does_not_raise(self):
+        """agent._session_manager is None → debug log, no error (AgentCore Runtime mode)."""
+        plugin, store = _make_plugin()
+        event = _make_before_event(has_session_manager=False)
+        # Should not raise — AgentCore Runtime runs without a SessionManager
+        plugin.before_invocation(event)
+        # retrieve_memories is called because agent.messages is empty (first turn)
+        store.retrieve_memories.assert_called_once()
 
     def test_retrieve_memories_exception_logs_warning_and_sets_prompt(self, caplog):
         """retrieve_memories exception → warning logged, prompt set with empty context."""
@@ -284,49 +286,39 @@ class TestBeforeInvocationFirstTurn:
 
 
 class TestBeforeInvocationSubsequentTurns:
-    """before_invocation on subsequent turns restores cached state without re-querying."""
+    """before_invocation on subsequent turns strips the placeholder without re-querying."""
 
-    def _setup_prior_turn(self, plugin, store, conversation_id="c1"):
-        """Simulate a prior turn by pre-populating plugin state."""
-        cached_prompt = "You are helpful. Relevant context from previous conversations:\n- Prior fact"
-        cached_messages = [
+    def _setup_subsequent_turn_event(self, conversation_id="c1"):
+        """Return an event whose agent.messages is non-empty (subsequent turn)."""
+        event = _make_before_event(conversation_id=conversation_id)
+        event.agent.messages = [
             {"role": "user", "content": [{"text": "hello"}]},
             {"role": "assistant", "content": [{"text": "hi there"}]},
         ]
-        plugin._injected_convs[conversation_id] = True
-        plugin._conv_buffer[f"_prompt_{conversation_id}"] = cached_prompt
-        plugin._conv_buffer[conversation_id] = cached_messages
-        return cached_prompt, cached_messages
+        return event
 
     def test_retrieve_memories_not_called_on_subsequent_turn(self):
-        """store.retrieve_memories NOT called when conversation_id already in _injected_convs."""
+        """store.retrieve_memories NOT called when agent.messages is non-empty."""
         plugin, store = _make_plugin()
-        self._setup_prior_turn(plugin, store, conversation_id="c1")
-
-        event = _make_before_event(conversation_id="c1")
+        event = self._setup_subsequent_turn_event(conversation_id="c1")
         plugin.before_invocation(event)
-
         store.retrieve_memories.assert_not_called()
 
-    def test_system_prompt_restored_from_cache(self):
-        """agent.system_prompt restored from _conv_buffer[f'_prompt_{conversation_id}']."""
+    def test_system_prompt_placeholder_stripped_on_subsequent_turn(self):
+        """agent.system_prompt has {memory_context} stripped on subsequent turns."""
         plugin, store = _make_plugin()
-        cached_prompt, _ = self._setup_prior_turn(plugin, store, conversation_id="c1")
-
-        event = _make_before_event(conversation_id="c1")
+        event = self._setup_subsequent_turn_event(conversation_id="c1")
         plugin.before_invocation(event)
+        assert "{memory_context}" not in event.agent.system_prompt
+        assert event.agent.system_prompt == event.agent.system_prompt.strip()
 
-        assert event.agent.system_prompt == cached_prompt
-
-    def test_messages_restored_from_cache_without_session_manager(self):
-        """agent.messages restored from _conv_buffer[conversation_id] when no SessionManager."""
+    def test_messages_not_overwritten_on_subsequent_turn(self):
+        """agent.messages is left untouched on subsequent turns (owned by SessionManager)."""
         plugin, store = _make_plugin()
-        _, cached_messages = self._setup_prior_turn(plugin, store, conversation_id="c1")
-
-        event = _make_before_event(conversation_id="c1", has_session_manager=False)
+        event = self._setup_subsequent_turn_event(conversation_id="c1")
+        original_messages = list(event.agent.messages)
         plugin.before_invocation(event)
-
-        assert event.agent.messages == cached_messages
+        assert event.agent.messages == original_messages
 
 
 # ---------------------------------------------------------------------------
@@ -336,55 +328,23 @@ class TestBeforeInvocationSubsequentTurns:
 
 
 class TestAfterInvocation:
-    """after_invocation snapshots messages and triggers session close correctly."""
-
-    def test_messages_written_to_buffer_without_session_manager(self):
-        """_cv_has_sm=False → agent.messages written to _conv_buffer[conv_id]."""
-        plugin, store = _make_plugin()
-        conv_id = "c-after-1"
-        plugin._cv_conv_id.set(conv_id)
-        plugin._cv_has_sm.set(False)
-
-        messages = [{"role": "user", "content": [{"text": "hello"}]}]
-        event, agent = _make_after_event(conv_id=conv_id, messages=messages)
-        agent.messages = messages
-
-        plugin.after_invocation(event)
-
-        assert conv_id in plugin._conv_buffer
-        assert plugin._conv_buffer[conv_id] == messages
-
-    def test_buffer_not_written_with_session_manager(self):
-        """_cv_has_sm=True → _conv_buffer NOT written."""
-        plugin, store = _make_plugin()
-        conv_id = "c-after-2"
-        plugin._cv_conv_id.set(conv_id)
-        plugin._cv_has_sm.set(True)
-
-        event, agent = _make_after_event(conv_id=conv_id)
-        plugin.after_invocation(event)
-
-        assert conv_id not in plugin._conv_buffer
+    """after_invocation triggers session close when end_session=True."""
 
     def test_end_session_true_submits_close_session(self):
         """end_session=True → close_session_with_data submitted to executor."""
         plugin, store = _make_plugin()
         conv_id = "c-after-3"
         plugin._cv_conv_id.set(conv_id)
-        plugin._cv_has_sm.set(False)
         plugin._cv_tenant.set(None)
         plugin._cv_user_id.set("u1")
 
         messages = [{"role": "user", "content": [{"text": "hello"}]}]
-        plugin._conv_buffer[conv_id] = messages
-
         event, agent = _make_after_event(conv_id=conv_id, end_session=True, messages=messages)
         agent.messages = messages
 
         with patch.object(plugin_module._executor, "submit") as mock_submit:
             plugin.after_invocation(event)
             mock_submit.assert_called_once()
-            # Verify close_session_with_data is the submitted callable
             assert mock_submit.call_args[0][0] == plugin.close_session_with_data
 
     def test_end_session_false_no_executor_submission(self):
@@ -392,13 +352,29 @@ class TestAfterInvocation:
         plugin, store = _make_plugin()
         conv_id = "c-after-4"
         plugin._cv_conv_id.set(conv_id)
-        plugin._cv_has_sm.set(False)
 
         event, agent = _make_after_event(conv_id=conv_id, end_session=False)
 
         with patch.object(plugin_module._executor, "submit") as mock_submit:
             plugin.after_invocation(event)
             mock_submit.assert_not_called()
+
+    def test_agent_messages_snapshot_passed_to_close_session(self):
+        """agent.messages snapshot is passed to close_session_with_data."""
+        plugin, store = _make_plugin()
+        conv_id = "c-after-5"
+        plugin._cv_conv_id.set(conv_id)
+        plugin._cv_tenant.set(None)
+        plugin._cv_user_id.set("u1")
+
+        messages = [{"role": "user", "content": [{"text": "hello"}]}]
+        event, agent = _make_after_event(conv_id=conv_id, end_session=True, messages=messages)
+        agent.messages = messages
+
+        with patch.object(plugin_module._executor, "submit") as mock_submit:
+            plugin.after_invocation(event)
+            submitted_messages = mock_submit.call_args[0][4]  # (fn, tenant, user_id, conv_id, messages, ...)
+            assert submitted_messages == messages
 
 
 # ---------------------------------------------------------------------------
@@ -543,12 +519,9 @@ class TestCloseSessionWithData:
         assert metadata["agent_name"] == "researcher"
 
     def test_cleanup_removes_conv_from_buffer_and_injected_convs(self):
-        """conv_id and _prompt_{conv_id} removed from _conv_buffer; conv_id discarded from _injected_convs."""
+        """close_session_with_data completes without error for a valid conversation."""
         plugin, store = _make_plugin()
         conv_id = "c-cleanup"
-        plugin._conv_buffer[conv_id] = [{"role": "user", "content": [{"text": "hi"}]}]
-        plugin._conv_buffer[f"_prompt_{conv_id}"] = "cached prompt"
-        plugin._injected_convs[conv_id] = True
 
         messages = [{"role": "user", "content": [{"text": "hi"}]}]
         mock_agent_instance = MagicMock()
@@ -556,11 +529,9 @@ class TestCloseSessionWithData:
         mock_agent_cls = MagicMock(return_value=mock_agent_instance)
 
         with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
-            plugin.close_session_with_data(None, "u1", conv_id, messages, self._make_model())
+            result = plugin.close_session_with_data(None, "u1", conv_id, messages, self._make_model())
 
-        assert conv_id not in plugin._conv_buffer
-        assert f"_prompt_{conv_id}" not in plugin._conv_buffer
-        assert conv_id not in plugin._injected_convs
+        assert result == "Summary."
 
     def test_embed_called_with_summary(self):
         """store._embed called with the summary text."""
@@ -635,14 +606,12 @@ class TestBuildPrompt:
 # ---------------------------------------------------------------------------
 
 class TestCloseSessionBufferClearedOnEmbedFailure:
-    """Issue #7: _embed is inside try/finally so buffers are always cleared."""
+    """Issue #7: _embed failure propagates as an exception from close_session_with_data."""
 
-    def test_buffers_cleared_even_when_embed_raises(self):
+    def test_embed_failure_raises(self):
+        """When _embed raises, close_session_with_data re-raises the exception."""
         plugin, store = _make_plugin()
         conv_id = "conv-embed-fail"
-        plugin._conv_buffer[conv_id] = [{"role": "user", "content": [{"text": "hi"}]}]
-        plugin._conv_buffer[f"_prompt_{conv_id}"] = "prompt"
-        plugin._injected_convs[conv_id] = True
         store._embed.side_effect = RuntimeError("Bedrock throttled")
 
         messages = [{"role": "user", "content": [{"text": "hi"}]}]
@@ -651,13 +620,8 @@ class TestCloseSessionBufferClearedOnEmbedFailure:
         mock_agent_cls = MagicMock(return_value=mock_agent_instance)
 
         with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
-            try:
+            with pytest.raises(RuntimeError, match="Bedrock throttled"):
                 plugin.close_session_with_data(None, "u1", conv_id, messages, MagicMock())
-            except Exception:
-                pass
-
-        assert conv_id not in plugin._conv_buffer
-        assert conv_id not in plugin._injected_convs
 
 
 # ---------------------------------------------------------------------------
@@ -672,12 +636,10 @@ class TestAfterInvocationBackgroundExceptionLogged:
         plugin, store = _make_plugin()
         conv_id = "conv-bg-fail"
         plugin._cv_conv_id.set(conv_id)
-        plugin._cv_has_sm.set(False)
         plugin._cv_tenant.set(None)
         plugin._cv_user_id.set("u1")
 
         messages = [{"role": "user", "content": [{"text": "hello"}]}]
-        plugin._conv_buffer[conv_id] = messages
         plugin.close_session_with_data = MagicMock(side_effect=RuntimeError("bg failure"))
 
         event = MagicMock()
@@ -711,12 +673,12 @@ class TestAfterInvocationBackgroundExceptionLogged:
 # ---------------------------------------------------------------------------
 
 class TestInjectedConvsBounded:
-    """Issue #9: _injected_convs must be a TTLCache, not an unbounded set."""
+    """Issue #9: plugin is stateless — no _injected_convs set; turn detection uses agent.messages."""
 
     def test_injected_convs_is_ttlcache_not_set(self):
+        """Plugin has no _injected_convs attribute — turn detection is via agent.messages."""
         plugin, _ = _make_plugin()
-        assert not isinstance(plugin._injected_convs, set)
-        assert isinstance(plugin._injected_convs, TTLCache)
+        assert not hasattr(plugin, "_injected_convs")
 
 
 # ---------------------------------------------------------------------------
@@ -753,7 +715,7 @@ class TestBuildPromptEmptyMessage:
         event = MagicMock()
         event.invocation_state = {"user_id": "u1", "conversation_id": "c1"}
         event.agent = MagicMock()
-        event.agent._session_manager = None
+        event.agent._session_manager = MagicMock()  # required by plugin
         event.agent.messages = []
         event.messages = []  # empty → extracted message is ""
 
@@ -803,8 +765,6 @@ class TestCloseSessionDeterministicKeyOverwrite:
 
         with patch.dict(sys.modules, {"strands": MagicMock(Agent=mock_agent_cls, Plugin=FakePlugin)}):
             plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
-            plugin._conv_buffer["c1"] = messages
-            plugin._injected_convs["c1"] = True
             plugin.close_session_with_data(None, "u1", "c1", messages, MagicMock())
 
         assert mock_client.put_vectors.call_count == 2

@@ -290,11 +290,11 @@ class TestS3VectorMemoryRetrieveMemories:
 # ---------------------------------------------------------------------------
 
 class TestS3VectorMemoryEmbed:
-    """_embed creates a bedrock-runtime client per call and returns the embedding."""
+    """_embed reuses the shared bedrock-runtime client and returns the embedding."""
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Create a store with a mocked s3vectors client at init time."""
+        """Create a store with mocked boto3 clients at init time."""
         with patch("boto3.client", return_value=_make_s3vectors_mock()):
             from strands_s3_vectors_memory.s3_vector_memory import S3VectorMemory
             self.store = S3VectorMemory(
@@ -304,25 +304,26 @@ class TestS3VectorMemoryEmbed:
             )
 
     def test_bedrock_client_created_per_embed_call(self):
-        """boto3.client('bedrock-runtime') is called once per _embed invocation."""
+        """boto3.client('bedrock-runtime') is called once at construction, not per _embed."""
+        # The shared client is self.store._bedrock — patch it directly
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock) as mock_boto3:
-            self.store._embed("hello", purpose="GENERIC_INDEX")
-            mock_boto3.assert_called_once_with("bedrock-runtime", region_name="us-east-1")
+        self.store._bedrock = mock_bedrock
+        self.store._embed("hello", purpose="GENERIC_INDEX")
+        mock_bedrock.invoke_model.assert_called_once()
 
     def test_invoke_model_called_with_correct_model_id(self):
         """invoke_model is called with the configured embedding_model as modelId."""
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock):
-            self.store._embed("hello", purpose="GENERIC_INDEX")
+        self.store._bedrock = mock_bedrock
+        self.store._embed("hello", purpose="GENERIC_INDEX")
         call_kwargs = mock_bedrock.invoke_model.call_args[1]
         assert call_kwargs["modelId"] == "amazon.nova-2-multimodal-embeddings-v1:0"
 
     def test_invoke_model_body_has_correct_task_type(self):
         """invoke_model body contains taskType='SINGLE_EMBEDDING'."""
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock):
-            self.store._embed("hello", purpose="GENERIC_INDEX")
+        self.store._bedrock = mock_bedrock
+        self.store._embed("hello", purpose="GENERIC_INDEX")
         call_kwargs = mock_bedrock.invoke_model.call_args[1]
         body = json.loads(call_kwargs["body"])
         assert body["taskType"] == "SINGLE_EMBEDDING"
@@ -330,8 +331,8 @@ class TestS3VectorMemoryEmbed:
     def test_invoke_model_body_has_correct_embedding_purpose(self):
         """invoke_model body contains the provided embeddingPurpose."""
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock):
-            self.store._embed("hello", purpose="GENERIC_RETRIEVAL")
+        self.store._bedrock = mock_bedrock
+        self.store._embed("hello", purpose="GENERIC_RETRIEVAL")
         call_kwargs = mock_bedrock.invoke_model.call_args[1]
         body = json.loads(call_kwargs["body"])
         purpose = body["singleEmbeddingParams"]["embeddingPurpose"]
@@ -340,8 +341,8 @@ class TestS3VectorMemoryEmbed:
     def test_invoke_model_body_has_embedding_dimension_1024(self):
         """invoke_model body contains embeddingDimension=1024."""
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock):
-            self.store._embed("hello", purpose="GENERIC_INDEX")
+        self.store._bedrock = mock_bedrock
+        self.store._embed("hello", purpose="GENERIC_INDEX")
         call_kwargs = mock_bedrock.invoke_model.call_args[1]
         body = json.loads(call_kwargs["body"])
         dim = body["singleEmbeddingParams"]["embeddingDimension"]
@@ -351,17 +352,18 @@ class TestS3VectorMemoryEmbed:
         """_embed returns embeddings[0]['embedding'] from the invoke_model response."""
         expected = [float(i) / 1024 for i in range(1024)]
         mock_bedrock = _make_bedrock_mock(embedding=expected)
-        with patch("boto3.client", return_value=mock_bedrock):
-            result = self.store._embed("hello", purpose="GENERIC_INDEX")
+        self.store._bedrock = mock_bedrock
+        result = self.store._embed("hello", purpose="GENERIC_INDEX")
         assert result == expected
 
     def test_two_embed_calls_create_two_bedrock_clients(self):
-        """Each _embed call creates a fresh bedrock-runtime client (thread-safety)."""
+        """Two _embed calls reuse the same shared client (no per-call client creation)."""
         mock_bedrock = _make_bedrock_mock()
-        with patch("boto3.client", return_value=mock_bedrock) as mock_boto3:
-            self.store._embed("first", purpose="GENERIC_INDEX")
-            self.store._embed("second", purpose="GENERIC_RETRIEVAL")
-        assert mock_boto3.call_count == 2
+        self.store._bedrock = mock_bedrock
+        self.store._embed("first", purpose="GENERIC_INDEX")
+        self.store._embed("second", purpose="GENERIC_RETRIEVAL")
+        # Both calls go through the same client instance
+        assert mock_bedrock.invoke_model.call_count == 2
 
 
 # ---------------------------------------------------------------------------
