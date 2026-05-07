@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # setup_cognito.sh — Creates Cognito User Pool, App Client, and two test users
-# for the blog: "Build a multi-tenant Agent memory using Amazon S3 Vector bucket"
+# for the S3 Vector Memory Plugin multi-tenant example.
 #
 # Usage: bash setup_cognito.sh
 #
@@ -12,12 +12,12 @@
 set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
-POOL_NAME="blog-vector-memory-user-pool"
-CLIENT_NAME="blog-vector-memory-client"
-USER_A_EMAIL="tenant001@blog-example.com"
-USER_B_EMAIL="tenant002@blog-example.com"
+POOL_NAME="strands-s3-vectors-memory-user-pool"
+CLIENT_NAME="strands-s3-vectors-memory-client"
+USER_A_EMAIL="tenant001@example.com"
+USER_B_EMAIL="tenant002@example.com"
 TEMP_PASSWORD="Temp@12345!"
-FINAL_PASSWORD="Blog@12345!"
+FINAL_PASSWORD="Test@12345!"
 
 echo "→ Region : $REGION"
 echo "→ Pool   : $POOL_NAME"

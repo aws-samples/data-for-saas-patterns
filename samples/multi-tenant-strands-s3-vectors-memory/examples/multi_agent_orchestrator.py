@@ -22,7 +22,10 @@ Index setup (run once before first use):
 """
 
 import os
+import sys
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from strands import Agent
 from strands.models import BedrockModel
@@ -36,12 +39,15 @@ BASE_PROMPT = """You are a helpful assistant.
 Use prior context naturally in your responses."""
 
 TENANT_CONTEXT = {"tenantId": "tenant-001"}
-USER_ID = "user-multi-agent-demo"
-MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+USER_ID        = "user-multi-agent-demo"
+MODEL_ID       = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+AWS_REGION     = os.environ.get("AWS_REGION", "us-east-1")
 
 # ---------------------------------------------------------------------------
 # Shared store and plugin — both agents use the same plugin instance.
 # agent.name is the only thing that separates their memory namespaces.
+# No S3SessionManager needed — this example runs as a script where each
+# agent is a singleton and agent.messages persists in-process.
 # ---------------------------------------------------------------------------
 store = MultiTenantS3VectorMemory(
     bucket_name  = os.environ["S3_VECTOR_BUCKET_NAME"],
@@ -52,23 +58,28 @@ plugin = S3VectorMemoryPlugin(store=store, base_prompt=BASE_PROMPT)
 orchestrator = Agent(
     model            = BedrockModel(model_id=MODEL_ID),
     name             = "orchestrator",   # required — unique per agent role
-    system_prompt    = BASE_PROMPT,
-    tools            = [plugin.memory_tool],
     plugins          = [plugin],
+    tools            = [plugin.memory_tool],
+    system_prompt    = BASE_PROMPT,
     callback_handler = None,
 )
 
 researcher = Agent(
     model            = BedrockModel(model_id=MODEL_ID),
     name             = "researcher",     # different namespace from orchestrator
-    system_prompt    = BASE_PROMPT,
-    tools            = [plugin.memory_tool],
     plugins          = [plugin],
+    tools            = [plugin.memory_tool],
+    system_prompt    = BASE_PROMPT,
     callback_handler = None,
 )
 
 
 def _turn(agent, agent_label, message, conv_id, end_session=False):
+    # Detect conversation change and reset messages (simulates microVM isolation)
+    if getattr(agent, "_current_conv_id", None) != conv_id:
+        agent.messages = []
+        agent._current_conv_id = conv_id
+
     response = agent(message, invocation_state={
         "tenant_context":  TENANT_CONTEXT,
         "user_id":         USER_ID,
