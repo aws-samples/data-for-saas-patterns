@@ -8,6 +8,7 @@ This repository contains a collection of samples, best practices and reference a
 * [Samples](./samples/)
 * * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
+* * [Multi-tenant S3 Vectors long-term memory for Strands Agents](README.md#multi-tenant-s3-vectors-long-term-memory-for-strands-agents)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
 * * [Tenant isolation patterns](README.md#tenant-isolation-patterns)
@@ -53,6 +54,14 @@ This sample describes both the self-managed Retrieval-augmented generation (RAG)
 [Example 1 - Self-managed](./samples/multi-tenant-vector-database/amazon-opensearch/self-managed/opensearch_self_managed_notebook.ipynb)
 
 [Example 2 - Fully-managed](./samples/multi-tenant-vector-database/amazon-opensearch/fully-managed/opensearch_fully_managed_notebook.ipynb)
+
+## Multi-tenant S3 Vectors long-term memory for Strands Agents
+
+This sample provides a [Strands Plugin](https://strandsagents.com/docs/user-guide/concepts/plugins/) that gives any Strands Agent long-term semantic memory backed by [Amazon S3 Vectors](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors.html). At the end of a conversation, the plugin summarizes the exchange and stores the summary as a searchable vector. On subsequent conversations, relevant summaries are retrieved and injected into the system prompt — the agent remembers across sessions without bloating the context window.
+
+Available in single-tenant (one shared index) and multi-tenant (one index per tenant with IAM ABAC isolation via a Token Vending Machine) modes. Designed for deployment on Amazon Bedrock AgentCore Runtime.
+
+[S3 Vector Memory Plugin for Strands Agents](./samples/multi-tenant-strands-s3-vectors-memory/)
 
 ## Scheduled Autoscaling Aurora Serverless V2
 
