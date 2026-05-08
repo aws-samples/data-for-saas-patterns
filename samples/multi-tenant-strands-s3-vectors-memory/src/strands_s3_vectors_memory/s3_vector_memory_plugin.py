@@ -1,9 +1,9 @@
 """
 s3_vector_memory_plugin.py — Strands Plugin for long-term semantic memory
 
-Works with both S3VectorMemory (single-tenant) and MultiTenantS3VectorMemory.
-Decoupled from any SessionManager — composes independently with Valkey or any
-other short-term session store.
+The plugin is stateless and relies on the hosting platform (AgentCore Runtime
+microVM) or an optional SessionManager to maintain agent.messages across turns.
+This plugin owns long-term semantic memory (S3 Vectors summaries).
 
 BASE_PROMPT must contain a {memory_context} placeholder. The plugin fills it
 with retrieved conversation summaries on the first turn of each conversation,
@@ -33,7 +33,6 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
-from cachetools import TTLCache
 from strands import Agent, Plugin, tool
 from strands.hooks import AfterInvocationEvent, BeforeInvocationEvent
 from strands.plugins import hook
@@ -55,8 +54,6 @@ _SUMMARIZE_PROMPT     = (
     "Be concise and factual. "
     "Do not use markdown formatting, headers, or bullet points — plain text only.\n\n"
 )
-_BUFFER_TTL     = 7200    # 2 hours — evict abandoned conversations
-_BUFFER_MAXSIZE = 10_000  # max concurrent conversations in-process
 _executor = ThreadPoolExecutor(max_workers=4)
 
 
@@ -64,9 +61,13 @@ class S3VectorMemoryPlugin(Plugin):
     """
     Strands Plugin for long-term semantic memory via S3 Vectors.
 
+    The plugin is stateless and relies on the hosting platform (AgentCore Runtime
+    microVM) or an optional SessionManager to maintain agent.messages across turns.
+    This plugin owns long-term semantic memory: it retrieves relevant summaries on
+    the first turn of each conversation and stores a new summary when end_session=True.
+
     Works with S3VectorMemory (single-tenant) or MultiTenantS3VectorMemory.
-    Identity and lifecycle are passed via invocation_state — no explicit
-    prepare() or close_session() calls required.
+    Identity and lifecycle are passed via invocation_state.
 
     BASE_PROMPT must contain {memory_context}. A warning is logged at
     construction time if the placeholder is missing.
@@ -87,18 +88,13 @@ class S3VectorMemoryPlugin(Plugin):
                 _MEMORY_PLACEHOLDER,
             )
 
-        self._cv_tenant:  contextvars.ContextVar[Optional[Dict]] = contextvars.ContextVar("tenant", default=None)
+        self._cv_tenant:     contextvars.ContextVar[Optional[Dict]] = contextvars.ContextVar("tenant", default=None)
         self._cv_user_id:    contextvars.ContextVar[str]            = contextvars.ContextVar("user_id", default="")
         self._cv_conv_id:    contextvars.ContextVar[str]            = contextvars.ContextVar("conv_id", default="")
-        self._cv_has_sm:     contextvars.ContextVar[bool]           = contextvars.ContextVar("has_session_manager", default=False)
         self._cv_agent_name: contextvars.ContextVar[Optional[str]]  = contextvars.ContextVar("agent_name", default=None)
-        self._conv_buffer:    TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
-        # Use a TTLCache instead of a plain set so entries are evicted automatically (#9)
-        self._injected_convs: TTLCache = TTLCache(maxsize=_BUFFER_MAXSIZE, ttl=_BUFFER_TTL)
 
         logger.debug(
-            "[s3-vector-memory] plugin init: store=%s buffer_ttl=%ds buffer_maxsize=%d",
-            type(store).__name__, _BUFFER_TTL, _BUFFER_MAXSIZE,
+            "[s3-vector-memory] plugin init: store=%s", type(store).__name__,
         )
 
     # -----------------------------------------------------------------------
@@ -125,72 +121,105 @@ class S3VectorMemoryPlugin(Plugin):
     @hook
     def before_invocation(self, event: BeforeInvocationEvent) -> None:
         """
-        Fired before every agent() call. Reads identity from invocation_state,
-        restores conversation buffer, resets system_prompt, and injects
-        long-term memories into the {memory_context} placeholder on the first
-        turn of each conversation.
+        Fired before every agent() call.
 
-        Required invocation_state keys: user_id, conversation_id
-        Optional: tenant_context (multi-tenant), end_session (handled after)
+        - Binds per-request identity from invocation_state.
+        - Determines turn number from agent.messages:
+            - Empty  → turn 1: retrieve long-term memories and inject into prompt.
+            - Non-empty → subsequent turn: strip placeholder from prompt.
         """
         state = event.invocation_state
+        agent = event.agent
+
         if "user_id" not in state:
             logger.debug("[s3-vector-memory] before_invocation: no user_id in state, skipping")
             return
-        if "conversation_id" not in state:  # guard for missing key (#10)
+        if "conversation_id" not in state:
             logger.warning(
                 "[s3-vector-memory] before_invocation: 'conversation_id' missing from "
                 "invocation_state — skipping memory setup."
             )
             return
 
+        if agent._session_manager is None:
+            # No SessionManager attached. This is correct on AgentCore Runtime
+            # where the microVM persists agent.messages across turns of the same
+            # session. On long-running servers (FastAPI, ECS) a SessionManager
+            # is required for durability — without it, agent.messages is lost
+            # when the process restarts.
+            logger.debug(
+                "[s3-vector-memory] before_invocation: no SessionManager — "
+                "relying on in-process agent.messages (AgentCore Runtime mode)"
+            )
+
+        self._cv_tenant.set(state.get("tenant_context"))
+        self._cv_user_id.set(state["user_id"])
+        self._cv_conv_id.set(state["conversation_id"])
+        self._cv_agent_name.set(agent.name or None)
+
         message = " ".join(
             b.get("text", "") for m in (event.messages or [])
             for b in m.get("content", []) if isinstance(b, dict) and "text" in b
         ).strip()
 
-        self._setup(
-            tenant_context  = state.get("tenant_context"),
-            user_id         = state["user_id"],
-            conversation_id = state["conversation_id"],
-            message         = message,
-            agent           = event.agent,
-        )
+        # agent.messages is maintained by the hosting platform (AgentCore microVM)
+        # or an optional SessionManager.
+        # Empty  → no prior turns exist → this is turn 1.
+        # Non-empty → prior turns present → subsequent turn.
+        is_first_turn = len(agent.messages) == 0
+
+        if is_first_turn:
+            logger.debug(
+                "[s3-vector-memory] before_invocation: turn=1 conv=%s user=%s "
+                "(agent.messages empty — querying S3 Vectors)",
+                state["conversation_id"], state["user_id"],
+            )
+            agent.system_prompt = self._build_prompt(
+                message,
+                state.get("tenant_context"),
+                state["user_id"],
+            )
+        else:
+            logger.debug(
+                "[s3-vector-memory] before_invocation: turn>1 conv=%s "
+                "(agent.messages has %d messages — skipping S3 Vectors query)",
+                state["conversation_id"], len(agent.messages),
+            )
+            # Subsequent turn — strip the {memory_context} placeholder so the LLM
+            # doesn't see the literal placeholder string. Memories were injected on
+            # turn 1 and are already in the conversation history via agent.messages.
+            agent.system_prompt = self._base_prompt.replace(
+                _MEMORY_PLACEHOLDER, ""
+            ).strip()
 
     @hook
     def after_invocation(self, event: AfterInvocationEvent) -> None:
         """
         Fired after every agent() call.
-        - Snapshots agent.messages into the buffer (no-SessionManager mode).
-        - If end_session=True, offloads summarization to a background thread.
+
+        If end_session=True, reads agent.messages and offloads summarization
+        + S3 Vectors storage to a background thread.
         """
         state   = event.invocation_state
         agent   = event.agent
         conv_id = self._cv_conv_id.get("")
 
-        if not self._cv_has_sm.get(False) and conv_id and agent:
-            msg_count = len(agent.messages)
-            self._conv_buffer[conv_id] = list(agent.messages)
-            logger.debug(
-                "[s3-vector-memory] after_invocation: buffered conv=%s messages=%d",
-                conv_id, msg_count,
-            )
-
         if state.get("end_session") and agent and conv_id:
             logger.debug(
-                "[s3-vector-memory] after_invocation: end_session=True conv=%s submitting background close",
-                conv_id,
+                "[s3-vector-memory] after_invocation: end_session=True conv=%s "
+                "messages=%d submitting background close",
+                conv_id, len(agent.messages),
             )
+            # agent.messages is the authoritative conversation transcript.
             future = _executor.submit(
                 self.close_session_with_data,
                 self._cv_tenant.get(None),
                 self._cv_user_id.get(""),
                 conv_id,
-                list(self._conv_buffer.get(conv_id, agent.messages)),
+                list(agent.messages),   # snapshot before background thread runs
                 agent.model,
-                self._cv_agent_name.get(None),  # capture before thread boundary
+                self._cv_agent_name.get(None),
             )
-            # Log any exception from the background task (#8)
             future.add_done_callback(
                 lambda f: f.exception() and logger.error(
                     "[s3-vector-memory] background close_session_with_data failed: %s",
@@ -283,51 +312,13 @@ class S3VectorMemoryPlugin(Plugin):
     # Internal helpers
     # -----------------------------------------------------------------------
 
-    def _setup(self, tenant_context: Optional[Dict], user_id: str,
-               conversation_id: str, message: str, agent: Agent) -> None:
-        """Bind identity, restore buffer, reset prompt, inject memories."""
-        self._cv_tenant.set(tenant_context)
-        self._cv_user_id.set(user_id)
-        self._cv_conv_id.set(conversation_id)
-        self._cv_agent_name.set(agent.name or None)
-
-        has_sm = agent._session_manager is not None
-        self._cv_has_sm.set(has_sm)
-
-        if not has_sm:
-            buffered = self._conv_buffer.get(conversation_id, [])
-            agent.messages = list(buffered)
-            logger.debug(
-                "[s3-vector-memory] _setup: restored %d messages for conv=%s",
-                len(buffered), conversation_id,
-            )
-
-        if conversation_id in self._injected_convs:
-            # Subsequent turn — restore the already-injected prompt
-            agent.system_prompt = self._conv_buffer.get(
-                f"_prompt_{conversation_id}", self._base_prompt
-            )
-            logger.debug(
-                "[s3-vector-memory] _setup: subsequent turn conv=%s prompt restored from cache",
-                conversation_id,
-            )
-        else:
-            # First turn — inject memories into placeholder
-            logger.debug(
-                "[s3-vector-memory] _setup: first turn conv=%s user=%s building prompt",
-                conversation_id, user_id,
-            )
-            agent.system_prompt = self._build_prompt(message, tenant_context, user_id)
-            self._injected_convs[conversation_id] = True  # TTLCache entry
-            self._conv_buffer[f"_prompt_{conversation_id}"] = agent.system_prompt
-
     def _build_prompt(self, query: str, tenant_context: Optional[Dict],
                       user_id: str) -> str:
         """Retrieve memories and fill the {memory_context} placeholder."""
         if _MEMORY_PLACEHOLDER not in self._base_prompt:
             return self._base_prompt
 
-        if not query or not query.strip():  # short-circuit on empty message (#11)
+        if not query or not query.strip():  # short-circuit on empty message
             logger.debug("[s3-vector-memory] _build_prompt: empty query, skipping retrieval")
             return self._base_prompt.replace(_MEMORY_PLACEHOLDER, "").strip()
 
@@ -367,7 +358,7 @@ class S3VectorMemoryPlugin(Plugin):
         model,
         agent_name: Optional[str] = None,
     ) -> Optional[str]:
-        """Summarize and store. Safe to call from a background thread."""
+        """Summarize and store the conversation. Safe to call from a background thread."""
         logger.debug(
             "[s3-vector-memory] close_session_with_data: conv=%s user=%s agent=%s messages=%d",
             conv_id, user_id, agent_name, len(messages),
@@ -400,13 +391,15 @@ class S3VectorMemoryPlugin(Plugin):
         )
 
         from strands import Agent as _Agent
+        # Call the model directly rather than constructing a new Agent — avoids
+        # re-initialising the Strands framework and hook registry on every end_session.
         summary = str(
             _Agent(model=model, system_prompt=_SUMMARIZE_PROMPT, callback_handler=None)(
                 "\n".join(transcript_lines)
             )
         ).strip()
 
-        # Truncate at the last sentence boundary <= 2000 chars (#12)
+        # Truncate at the last sentence boundary <= 2000 chars
         if len(summary) > 2000:
             truncated = summary[:2000]
             last_boundary = max(
@@ -428,7 +421,6 @@ class S3VectorMemoryPlugin(Plugin):
         )
 
         key = f"{user_id}_{agent_name or 'default'}_summary_{hashlib.sha256(conv_id.encode()).hexdigest()[:16]}"
-        # _embed is inside try so that the finally always clears buffers (#7)
         try:
             embedding = self._store._embed(summary, purpose="GENERIC_INDEX")
             client    = self._store._get_s3vectors_client(tenant_context)
@@ -437,7 +429,7 @@ class S3VectorMemoryPlugin(Plugin):
                 indexName=self._store._build_index_name(tenant_context),
                 vectors=[{
                     "key":  key,
-                    "data": {"float32": [float(x) for x in embedding]},
+                    "data": {"float32": embedding},
                     "metadata": {
                         "user_id":         user_id,
                         "agent_name":      agent_name or "default",
@@ -451,12 +443,11 @@ class S3VectorMemoryPlugin(Plugin):
                 "[s3-vector-memory] close_session_with_data: stored summary key=%s conv=%s",
                 key, conv_id,
             )
-        finally:
-            self._conv_buffer.pop(conv_id, None)
-            self._conv_buffer.pop(f"_prompt_{conv_id}", None)
-            self._injected_convs.pop(conv_id, None)
-            logger.debug(
-                "[s3-vector-memory] close_session_with_data: buffers cleared conv=%s", conv_id,
+        except Exception as exc:
+            logger.error(
+                "[s3-vector-memory] close_session_with_data: failed to store summary "
+                "conv=%s error=%s", conv_id, exc,
             )
+            raise
 
         return summary

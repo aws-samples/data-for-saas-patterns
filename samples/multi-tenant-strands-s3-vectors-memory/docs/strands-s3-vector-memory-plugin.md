@@ -23,7 +23,7 @@ Available in two modes:
 - Python 3.10+
 - `strands-agents >= 1.0.0`
 - `boto3 >= 1.35`
-- `cachetools >= 5.0` (multi-tenant only)
+- `cachetools >= 5.0` (used by TokenVendingMachine for credential caching)
 - AWS account with S3 Vectors access and Bedrock Nova Embeddings enabled in your region
 
 ## Install
@@ -149,7 +149,7 @@ plugin = S3VectorMemoryPlugin(
 )
 ```
 
-The plugin is a singleton — create it once and reuse it across all requests. It maintains an internal `TTLCache` keyed by `conversation_id` (maxsize 10,000, TTL 2 hours).
+The plugin is a singleton -- create it once and reuse it across all requests. It is stateless and relies on `agent.messages` (maintained by the hosting platform or a SessionManager) for turn detection.
 
 ### 4. Agent creation
 
@@ -161,12 +161,14 @@ from strands.models import BedrockModel
 
 agent = Agent(
     model         = BedrockModel(),
-    system_prompt = BASE_PROMPT,  # must match the base_prompt passed to the plugin
+    name          = "assistant",     # required — used as memory namespace key
+    system_prompt = BASE_PROMPT,     # must match the base_prompt passed to the plugin
     tools         = [plugin.memory_tool],  # optional — enables mid-turn recall
     plugins       = [plugin],
 )
 ```
 
+- `name` is required. The plugin enforces this at wiring time — if `agent.name` is not set, `Agent(plugins=[plugin])` raises `ValueError`. The name is used as the memory namespace key and must be stable across restarts.
 - `system_prompt` should be set to `BASE_PROMPT` at construction. The plugin resets it on every call, so the initial value is overwritten immediately — but it must be set to avoid a `None` prompt on the very first call before the hook fires.
 - `callback_handler=None` suppresses Strands' default streaming output to stdout. Omit it if you want streaming.
 - `tools=[plugin.memory_tool]` is optional. Without it, the agent still gets automatic memory injection on the first turn of each conversation via `before_invocation`. The tool adds the ability for the LLM to retrieve memories on demand mid-turn.
@@ -258,23 +260,28 @@ Relevant memories:
 - [20250115_090000] User prefers conservative financial planning.
 ```
 
-### Composing with a Short-Term Session Manager
+### Composing with a Short-Term Session Store
 
-The plugin is decoupled from any `SessionManager`. Attach both independently:
+The plugin is decoupled from any `SessionManager`. It works in two modes:
+
+**AgentCore Runtime (recommended):** No SessionManager needed. The microVM persists `agent.messages` across turns of the same session automatically.
+
+**ECS/Lambda/long-running servers:** Attach an `S3SessionManager` (or equivalent) to persist `agent.messages` across requests that may hit different processes.
+
+| Concern | Owner |
+|---------|-------|
+| Conversation history within a session | Platform (AgentCore microVM) or `SessionManager` |
+| Long-term semantic memory across conversations | `S3VectorMemoryPlugin` |
 
 ```python
 agent = Agent(
     model           = BedrockModel(),
+    name            = "assistant",
     system_prompt   = BASE_PROMPT,
     session_manager = session_manager,   # short-term: persists agent.messages
     plugins         = [plugin],          # long-term:  semantic memory via S3 Vectors
 )
 ```
-
-| Concern | Owner |
-|---------|-------|
-| Conversation history across HTTP requests | `SessionManager` (Valkey, DynamoDB, etc.) |
-| Long-term semantic memory across conversations | `S3VectorMemoryPlugin` |
 
 ## Quick Start Examples
 
@@ -296,6 +303,7 @@ store  = S3VectorMemory(bucket_name=os.environ["S3_VECTOR_BUCKET_NAME"])
 plugin = S3VectorMemoryPlugin(store=store, base_prompt=BASE_PROMPT)
 agent  = Agent(
     model         = BedrockModel(),
+    name          = "assistant",
     tools         = [plugin.memory_tool],  # optional: mid-turn recall on demand
     plugins       = [plugin],
     system_prompt = BASE_PROMPT,
@@ -338,6 +346,7 @@ store  = MultiTenantS3VectorMemory(
 plugin = S3VectorMemoryPlugin(store=store, base_prompt=BASE_PROMPT)
 agent  = Agent(
     model         = BedrockModel(),
+    name          = "assistant",
     tools         = [plugin.memory_tool],  # optional: mid-turn recall on demand
     plugins       = [plugin],
     system_prompt = BASE_PROMPT,
@@ -375,9 +384,10 @@ agent(message, invocation_state={...})
         ▼
 before_invocation hook
   ├── bind tenant + user + conversation identity
-  ├── restore agent.messages from in-process buffer (no SessionManager mode)
+  ├── detect turn number via len(agent.messages)
   ├── reset agent.system_prompt to base_prompt
-  └── on first turn of conversation:
+  └── on first turn of conversation (agent.messages empty):
+      └── retrieve memories → inject into {memory_context}
         embed query → query_vectors → inject top-K summaries into system_prompt
         │
         ▼
@@ -389,9 +399,9 @@ after_invocation hook
   └── if end_session=True:
         submit close_session_with_data() to background thread (non-blocking)
           ├── build transcript from messages
-          ├── LLM summarizes in ≤500 characters
+          ├── LLM summarizes in ≤2000 characters
           ├── embed summary → put_vectors (deterministic key on conversation_id)
-          └── clear conversation buffer (always, even on error)
+          └── done (buffers owned by platform, not plugin)
 ```
 
 ### Memory Retrieval
@@ -401,10 +411,6 @@ On the first turn of each `conversation_id`, the plugin embeds the user's messag
 ### Memory Storage
 
 When `end_session=True` is passed in `invocation_state`, the `after_invocation` hook offloads summarization and storage to a background thread so the response is returned immediately. The summary key is deterministic on `conversation_id` — storing the same conversation twice is a clean overwrite, not a duplicate.
-
-### In-Process Conversation Buffer
-
-When no `SessionManager` is attached, the plugin maintains an in-process buffer keyed by `conversation_id`. It restores `agent.messages` before each turn and snapshots them back after, allowing a singleton agent to serve multiple concurrent conversations correctly. When a `SessionManager` is present, it owns `agent.messages` and the buffer is bypassed.
 
 ### Tenant Isolation (Multi-Tenant)
 
@@ -449,6 +455,7 @@ plugin = S3VectorMemoryPlugin(store=store, base_prompt=BASE_PROMPT)
 
 agent = Agent(
     model   = BedrockModel(),
+    name    = "assistant",
     tools   = [plugin.memory_tool],  # mid-turn retrieval on demand
     plugins = [plugin],              # auto-inject on first turn + end_session store
 )
@@ -515,15 +522,15 @@ Calls `STS AssumeRole` with a `TenantID` session tag and caches credentials per 
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Plugin vs SessionManager | Plugin | `SessionManager` is single-occupancy and owns short-term state. Plugin composes independently alongside any `SessionManager`. |
+| Plugin vs SessionManager | Plugin | Plugin owns long-term memory only. Short-term conversation state is owned by the hosting platform (AgentCore microVM) or an optional SessionManager. |
 | Memory storage unit | One summary per conversation | Keeps index compact, improves retrieval relevance, reduces embedding cost. |
 | Index isolation (multi-tenant) | One index per tenant | S3 Vectors has no data-level IAM condition keys — isolation must be enforced at the resource ARN level. |
 | Credential scoping (multi-tenant) | TVM (STS AssumeRole + TenantID session tag) | Ambient credentials have broad access. TVM credentials are physically scoped to one tenant's index. |
 | No ambient fallback in multi-tenant | Always raise without TVM role | Silent fallback to ambient credentials would bypass IAM ABAC isolation with no error. |
 | Hook-driven vs explicit lifecycle | Hook-driven only | The explicit `prepare()` and `close_session()` methods have been removed. They relied on `ContextVar` values that are only valid in the same thread/context as `before_invocation`, making them unreliable when called from request teardown handlers or different async tasks. The hook-driven path via `invocation_state` is the only supported interface. |
 | `{memory_context}` placeholder | Placeholder in `BASE_PROMPT` | Gives agent authors control over where memories appear in the prompt. Warning logged at construction if placeholder is missing. |
-| Conversation buffer eviction | `TTLCache(maxsize=10_000, ttl=7200)` | Evicts after 2 hours and caps at 10,000 entries (~220MB worst case). |
-| Summary truncation | Sentence boundary ≤ 500 chars | Hard truncation mid-sentence produces grammatically broken stored memories. |
+| Conversation buffer eviction | Not applicable | Plugin is stateless -- no in-process buffer. Conversation state is owned by the platform (AgentCore microVM) or SessionManager. |
+| Summary truncation | Sentence boundary ≤ 2000 chars | Hard truncation mid-sentence produces grammatically broken stored memories. |
 | Background summarization | Non-blocking thread | Summarization involves two Bedrock calls (~2–4s). Offloading keeps the agent response latency unaffected. |
 | TVM credential caching | `boto3.Session` cached 12 min per tenant | 3-minute buffer before 15-minute STS expiry. On failure, `None` sentinel cached to prevent thundering-herd retries. |
 | Explicit memory access from Agent | Retrieve-only mid-turn via `memory_tool`; store via plugin lifecycle | Exposing a store tool to the agent mid-turn would let the LLM decide what and when to store, producing inconsistent, noisy memories. Retrieval mid-turn is safe and useful — the agent can query prior context on demand via `plugin.memory_tool`. Storage is reserved for the plugin's `end_session` path, which always stores a structured LLM-generated summary of the full conversation, not arbitrary fragments chosen by the model. |

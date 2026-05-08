@@ -4,7 +4,7 @@
 set -euo pipefail
 
 BUCKET_NAME="${1:?Usage: bash setup_tvm_role.sh <s3-vector-bucket-name>}"
-ROLE_NAME="workshop-module3-lab1-s3vectors-tvm-role"
+ROLE_NAME="strands-s3-vectors-memory-tvm-role"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION="${AWS_REGION:-us-east-1}"
 

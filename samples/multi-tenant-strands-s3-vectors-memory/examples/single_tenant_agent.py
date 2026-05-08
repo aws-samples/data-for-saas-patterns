@@ -1,24 +1,50 @@
 """
-single_tenant_agent.py — Example: single-tenant agent with S3 Vector long-term memory
+single_tenant_agent.py — Single-tenant agent with S3 Vector long-term memory,
+deployed on Amazon Bedrock AgentCore Runtime.
 
-No JWT, no TVM role. One shared index, ambient AWS credentials.
-Identity passed directly via invoke().
+AgentCore Runtime provides session isolation at the infrastructure level:
+each runtimeSessionId is routed to a dedicated microVM that persists for up
+to 8 hours. All turns of a conversation arrive at the SAME microVM, so
+agent.messages is maintained in memory across turns automatically.
 
-Install the library first:
-    pip install strands-s3-vectors-memory
+No S3SessionManager is needed — the microVM IS the session store.
+The plugin uses len(agent.messages) == 0 to detect the first turn of a
+conversation (fresh microVM) and retrieves long-term memories from S3 Vectors.
+
+HTTP contract (required by AgentCore Runtime):
+  GET  /ping         — health check, returns {"status": "Healthy"}
+  POST /invocations  — agent call, payload: {"prompt": str, "end_session": bool}
+
+AgentCore Runtime injects:
+  runtimeSessionId  → used as conversation_id  (via X-Amzn-Bedrock-AgentCore-Runtime-Session-Id header)
 
 Env vars: S3_VECTOR_BUCKET_NAME, AWS_REGION, BEDROCK_MODEL_ID
+
+Local test:
+  pip install bedrock-agentcore-starter-toolkit
+  S3_VECTOR_BUCKET_NAME=... python3 single_tenant_agent.py
+
+Deploy:
+  See README.md — "Run the examples → Deploy to AgentCore Runtime"
 """
 
+import logging
 import os
+import sys
 
+# Ensure the library src/ is on the path when running inside AgentCore Runtime
+# (the toolkit packages the repo root, so src/ is at /var/task/src/)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 
 from strands_s3_vectors_memory import S3VectorMemory, S3VectorMemoryPlugin
 
-# {memory_context} is filled by the plugin on the first turn of each conversation.
-# If no memories are found, the placeholder is replaced with an empty string.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
+
 BASE_PROMPT = """You are a helpful assistant.
 
 {memory_context}
@@ -26,73 +52,71 @@ BASE_PROMPT = """You are a helpful assistant.
 Use prior context naturally in your responses without explicitly announcing
 that you are recalling past information, unless the user asks."""
 
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# ---------------------------------------------------------------------------
+# Singletons — AgentCore Runtime routes all turns of a conversation to the
+# same microVM, so agent.messages persists in memory across turns.
+# No S3SessionManager needed — the microVM IS the session store.
+# ---------------------------------------------------------------------------
 _store  = S3VectorMemory(bucket_name=os.environ["S3_VECTOR_BUCKET_NAME"])
 _plugin = S3VectorMemoryPlugin(store=_store, base_prompt=BASE_PROMPT)
 _agent  = Agent(
     model            = BedrockModel(model_id=os.environ.get("BEDROCK_MODEL_ID",
                                    "us.anthropic.claude-sonnet-4-5-20250929-v1:0")),
     name             = "assistant",
-    system_prompt    = BASE_PROMPT,
-    tools            = [_plugin.memory_tool],  # mid-turn recall on demand
     plugins          = [_plugin],
-    callback_handler = None,   # suppress streaming output — we print ourselves
+    tools            = [_plugin.memory_tool],
+    system_prompt    = BASE_PROMPT,
+    callback_handler = None,
 )
 
+# ---------------------------------------------------------------------------
+# AgentCore Runtime app — wraps the agent in the required HTTP server
+# ---------------------------------------------------------------------------
+app = BedrockAgentCoreApp()
 
-def invoke(user_id: str, conversation_id: str, message: str,
-           end_session: bool = False) -> str:
+
+@app.entrypoint
+def invoke(payload: dict, context) -> dict:
     """
-    Process a single request.
+    Called by AgentCore Runtime for every /invocations request.
 
-    Args:
-        user_id:         User identifier.
-        conversation_id: Unique conversation ID.
-        message:         The user's message.
-        end_session:     If True, summarize and store the conversation after response.
+    context.session_id  -- runtimeSessionId, scoped to this conversation by
+                           AgentCore Runtime's session isolation infrastructure.
+                           All turns of the same conversation arrive at this
+                           same microVM, so agent.messages is already populated
+                           on turns 2+.
 
-    Returns:
-        The agent's response as a string.
+    For local testing (single process serving multiple conversations), we detect
+    conversation changes and reset agent.messages to simulate microVM isolation.
     """
-    return str(_agent(message, invocation_state={
+    conversation_id = context.session_id or "default"
+    user_id         = payload.get("user_id", conversation_id)
+    message         = payload.get("prompt", "")
+    end_session     = payload.get("end_session", False)
+
+    # Detect conversation change — on AgentCore Runtime this never fires because
+    # each conversation gets its own microVM. Needed for local testing only.
+    if getattr(_agent, "_current_conv_id", None) != conversation_id:
+        _agent.messages = []
+        _agent._current_conv_id = conversation_id
+
+    response     = _agent(message, invocation_state={
         "user_id":         user_id,
         "conversation_id": conversation_id,
         "end_session":     end_session,
-    }))
+    })
+    response_str = str(response)
 
+    logger.info(
+        "[request] conv=%s user=%s end_session=%s\n  USER : %s\n  AGENT: %s",
+        conversation_id, user_id, end_session,
+        message[:200], response_str[:200],
+    )
 
-def _turn(user_id, conv_id, message, end_session=False):
-    """Print a labelled turn and return the response."""
-    print(f"\n  USER: {message}")
-    response = invoke(user_id, conv_id, message, end_session=end_session)
-    print(f" AGENT: {response}")
-    if end_session:
-        print("        [end_session=True — summarizing in background]")
-    return response
+    return {"response": response_str}
 
 
 if __name__ == "__main__":
-    import time
-    user_id = "user-001"
-
-    print("=" * 60)
-    print("SESSION 1 — storing a fact")
-    print("=" * 60)
-    _turn(user_id, "conv-001", "My favourite framework is Strands Agents.")
-    _turn(user_id, "conv-001", "What framework did I mention?", end_session=True)
-
-    print("\n[waiting 5s for background summary store to complete...]")
-    time.sleep(5)
-
-    print("\n" + "=" * 60)
-    print("SESSION 2 — memory injected automatically on first turn")
-    print("=" * 60)
-    _turn(user_id, "conv-002", "What do you know about my preferences?")
-
-    print("\n" + "=" * 60)
-    print("SESSION 3 — memory_tool: mid-turn recall on demand")
-    print("  The agent uses the memory_tool when it needs to recall")
-    print("  something specific mid-conversation.")
-    print("=" * 60)
-    _turn(user_id, "conv-003",
-          "I'm evaluating some new tools. By the way, remind me — "
-          "what framework did I mention I liked in a previous session?")
+    app.run(port=int(os.environ.get("PORT", "8080")))
