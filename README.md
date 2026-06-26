@@ -9,6 +9,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * * [Multi-tenant S3 Vectors long-term memory for Strands Agents](README.md#multi-tenant-s3-vectors-long-term-memory-for-strands-agents)
+* * [Multi-tenant AI Agent with BigQuery Row-Level Security](README.md#multi-tenant-ai-agent-with-bigquery-row-level-security)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
 * * [Tenant isolation patterns](README.md#tenant-isolation-patterns)
@@ -62,6 +63,14 @@ This sample provides a [Strands Plugin](https://strandsagents.com/docs/user-guid
 Available in single-tenant (one shared index) and multi-tenant (one index per tenant with IAM ABAC isolation via a Token Vending Machine) modes. Designed for deployment on Amazon Bedrock AgentCore Runtime.
 
 [S3 Vector Memory Plugin for Strands Agents](./samples/multi-tenant-strands-s3-vectors-memory/)
+
+## Multi-tenant AI Agent with BigQuery Row-Level Security
+
+This sample demonstrates how to build a multi-tenant AI agent that accesses Google BigQuery through Amazon Bedrock AgentCore, with per-tenant data isolation enforced by BigQuery Row-Level Security (RLS) and cross-cloud authentication via GCP Workload Identity Federation (WIF). No GCP secrets are stored on the AWS side.
+
+Two integration paths are shown: a custom Lambda target for full control, and a managed MCP Server target for zero-code integration. Both achieve identical tenant isolation through per-tenant GCP service accounts and BigQuery RLS.
+
+[Multi-Tenant AI Agent with BigQuery RLS](./samples/multi-tenant-agent-bigquery-rls/)
 
 ## Scheduled Autoscaling Aurora Serverless V2
 
