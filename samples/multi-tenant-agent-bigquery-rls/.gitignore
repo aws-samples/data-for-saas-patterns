@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+cdk.out/
+
+# Generated config (created by 01_setup_wif.sh from wif_config.template.json)
+**/wif_config.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# CDK
+cdk/cdk.out/
+cdk/.venv/
+
+# Agent
+agent/uv.lock
+
+# OS
+.DS_Store
