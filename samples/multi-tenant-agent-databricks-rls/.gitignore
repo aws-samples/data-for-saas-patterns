@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+cdk.out/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# CDK
+cdk/cdk.out/
+cdk/.venv/
+
+# Agent
+agent/uv.lock
+
+# Environment
+.lab_env
+.env
+
+# OS
+.DS_Store
