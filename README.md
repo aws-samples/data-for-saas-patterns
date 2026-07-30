@@ -10,6 +10,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * * [Multi-tenant S3 Vectors long-term memory for Strands Agents](README.md#multi-tenant-s3-vectors-long-term-memory-for-strands-agents)
 * * [Multi-tenant AI Agent with BigQuery Row-Level Security](README.md#multi-tenant-ai-agent-with-bigquery-row-level-security)
+* * [Multi-tenant AI Agent with Databricks Row-Level Security](README.md#multi-tenant-ai-agent-with-databricks-row-level-security)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
 * * [Tenant isolation patterns](README.md#tenant-isolation-patterns)
@@ -71,6 +72,16 @@ This sample demonstrates how to build a multi-tenant AI agent that accesses Goog
 Two integration paths are shown: a custom Lambda target for full control, and a managed MCP Server target for zero-code integration. Both achieve identical tenant isolation through per-tenant GCP service accounts and BigQuery RLS.
 
 [Multi-Tenant AI Agent with BigQuery RLS](./samples/multi-tenant-agent-bigquery-rls/)
+
+## Multi-tenant AI Agent with Databricks Row-Level Security
+
+This sample demonstrates how to build a multi-tenant AI agent that accesses Databricks through Amazon Bedrock AgentCore, with per-tenant data isolation enforced by Unity Catalog row filters. Cross-cloud authentication uses AWS IAM Workload Identity Federation (WIF), so no Databricks secrets are stored on the AWS side.
+
+A shared AI agent serves multiple tenants. Each tenant gets a dedicated Databricks service principal. At request time, a Lambda or interceptor exchanges the caller's AWS IAM credentials for a short-lived Databricks token scoped to that tenant's SP. Unity Catalog row filters then restrict query results based on who is asking.
+
+Two integration paths are shown: a custom Lambda target for full control, and a managed MCP Server target for zero-code integration. Both achieve identical tenant isolation through per-tenant service principals and Unity Catalog row filters.
+
+[Multi-Tenant AI Agent with Databricks RLS](./samples/multi-tenant-agent-databricks-rls/)
 
 ## Scheduled Autoscaling Aurora Serverless V2
 
