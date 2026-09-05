@@ -11,7 +11,7 @@ CREATE SCHEMA self_managed;
 
 --Step 4 : Create the Vector table
 
-CREATE TABLE self_managed.kb (id uuid PRIMARY KEY, embedding vector(1536), chunks text, metadata jsonb, tenantid bigint);
+CREATE TABLE self_managed.kb (id uuid PRIMARY KEY, embedding vector(1024), chunks text, metadata jsonb, tenantid bigint);
 
 --Step 5 : Create the Index
 
