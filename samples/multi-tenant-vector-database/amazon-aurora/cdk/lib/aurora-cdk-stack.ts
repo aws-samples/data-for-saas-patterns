@@ -54,7 +54,7 @@ export class AuroraCdkStack extends cdk.Stack {
 
     const dbCluster = new DatabaseCluster(this, 'DbCluster', {
       engine: DatabaseClusterEngine.auroraPostgres({
-        version: AuroraPostgresEngineVersion.VER_16_2,
+        version: AuroraPostgresEngineVersion.VER_17_7,
       }),
       iamAuthentication: true,
       storageEncrypted: true,
