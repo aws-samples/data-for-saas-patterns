@@ -14,6 +14,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
 * * [Aurora Global Database Serverless V2](README.md#aurora-global-database-serverless-v2)
 * * [Tenant isolation patterns](README.md#tenant-isolation-patterns)
+* * [Tenant migration into a cell](README.md#tenant-migration-into-a-cell)
 * [Data for SaaS blogs](README.md#data-for-saas-blogs-books)
 * [Videos](README.md#videos-movie_camera)
 
@@ -98,6 +99,12 @@ This sample provides a CDK application that creates Amazon Aurora Global databas
 ## Tenant isolation patterns
 
 This sample provides tenant isolation patterns using [Attribute Based Access Control (ABAC)](https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction_attribute-based-access-control.html), implemented with [AssumeRoleWithWebIdentity](https://aws.amazon.com/blogs/security/saas-tenant-isolation-with-abac-using-aws-sts-support-for-tags-in-jwt/) for a robust tenant isolation mechanism.
+
+## Tenant migration into a cell
+
+This sample moves one tenant at a time from a pooled platform into a cell on Amazon Aurora PostgreSQL and Amazon S3, and proves the move is correct before cutover. Message content moves out of PostgreSQL into a per-tenant S3 bucket by content hash, using S3 conditional writes for deduplication. Permissions move to a new model and are checked by a differential harness, existing objects are copied with S3 Batch Operations, and a reconciliation step blocks cutover unless counts, checksums and every content reference agree. A cutover command then freezes, re-verifies and redirects the tenant, rolling back automatically on failure. It runs locally or on AWS, with CDK.
+
+[Sample](./samples/tenant-migration-to-cells/) | [Guide](./samples/tenant-migration-to-cells/docs/GUIDE.md) | [Reference architecture](./reference-architectures/tenant-migration-to-cells.md)
 
 ## Data for SaaS Blogs :books:
 

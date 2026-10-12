@@ -1,0 +1,16 @@
+[project]
+name = "tenantmig"
+version = "0.1.0"
+description = "Per-tenant migration from a pooled platform into a cell"
+requires-python = ">=3.11"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "boto3>=1.35",
+]
+
+[project.scripts]
+tenantmig = "tenantmig.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

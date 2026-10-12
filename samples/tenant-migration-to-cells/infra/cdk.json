@@ -1,0 +1,8 @@
+{
+  "app": "npx ts-node --prefer-ts-exts bin/app.ts",
+  "context": {
+    "monthlyBudgetUsd": 50,
+    "v1EngineVersion": "15.12",
+    "v2EngineVersion": "18.4"
+  }
+}
