@@ -144,6 +144,7 @@ cdk deploy --all
 
 This creates:
 - Cognito User Pool with test users (tenant-001, tenant-002)
+- A Secrets Manager secret (`multi-tenant-databricks-test-user-password`) with an auto-generated password for the test users
 - AgentCore Gateway with Cognito JWT authorizer
 - DynamoDB table (`multi-tenant-databricks-wif-config`)
 - Interceptor Lambda (header injection + WIF exchange)
@@ -176,10 +177,18 @@ What this creates:
 
 Establishes trust between AWS IAM and Databricks. No secrets stored.
 
+`DATABRICKS_ACCOUNT_TOKEN` is an account-level OAuth token that **expires after 1 hour**, so generate a fresh one immediately before running the script:
+
 ```bash
-export DATABRICKS_ACCOUNT_TOKEN=<account-level-token>
+export DATABRICKS_ACCOUNT_TOKEN=$(databricks auth token \
+  --host https://accounts.cloud.databricks.com \
+  --account-id "$DATABRICKS_ACCOUNT_ID" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
 bash 02_setup_wif.sh
 ```
+
+> **Note:** If `02_setup_wif.sh` fails on the federation-policy step with a `401`/`403` ("Credential was not sent or was of an unsupported type" or "user is unauthenticated"), the token has most likely expired — re-run the `export` above and try again. Creating the federation policies also requires that this token belongs to an **account admin**. Databricks Free Edition has no account console or account-admin role, so this step cannot complete there — use a Standard, Paid, or Trial account.
 
 What this does:
 - Verifies AWS IAM Outbound Identity Federation is enabled
@@ -190,6 +199,8 @@ What this does:
 ---
 
 ### Step 4: Test Lambda target
+
+The test-user password is auto-generated into AWS Secrets Manager at deploy time (secret `multi-tenant-databricks-test-user-password`, exposed via the `TestUserPasswordSecretArn` stack output). The test scripts (`03`/`04`/`05`) fetch it automatically, so no password is stored in source. To override, export `TEST_PASSWORD` before running a script.
 
 ```bash
 bash 03_test_lambda_target.sh
