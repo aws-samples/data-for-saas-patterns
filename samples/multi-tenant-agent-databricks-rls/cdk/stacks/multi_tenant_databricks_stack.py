@@ -27,6 +27,7 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_lambda as _lambda,
     aws_iam as iam,
+    aws_secretsmanager as secretsmanager,
     custom_resources as cr,
 )
 from constructs import Construct
@@ -45,6 +46,9 @@ def handler(event, context):
         client = boto3.client('cognito-idp')
         pool_id = event['ResourceProperties']['UserPoolId']
         users = event['ResourceProperties']['Users']
+        secret_arn = event['ResourceProperties']['SecretArn']
+        sm = boto3.client('secretsmanager')
+        password = sm.get_secret_value(SecretId=secret_arn)['SecretString']
         for user in users:
             try:
                 client.admin_create_user(
@@ -60,7 +64,7 @@ def handler(event, context):
                 pass
             client.admin_set_user_password(
                 UserPoolId=pool_id, Username=user['email'],
-                Password=user['password'], Permanent=True,
+                Password=password, Permanent=True,
             )
         cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Users created'})
     except Exception as e:
@@ -106,6 +110,22 @@ class MultiTenantDatabricksStack(Stack):
             resources=[user_pool.user_pool_arn],
         ))
 
+        # Auto-generated password for the Cognito test users. 20 chars with one of each
+        # character class satisfies Cognito's default policy (len>=8, upper/lower/digit/symbol).
+        # exclude_characters drops chars that break shell/CSV interpolation in the test scripts
+        # (double/single quote, @, /, backslash, backtick, $).
+        test_user_secret = secretsmanager.Secret(self, "TestUserPassword",
+            secret_name="multi-tenant-databricks-test-user-password",
+            description="Auto-generated password for the Cognito test users (tenant-001, tenant-002).",
+            generate_secret_string=secretsmanager.SecretStringGenerator(
+                password_length=20,
+                require_each_included_type=True,
+                exclude_punctuation=False,
+                exclude_characters="\"'@/\\`$",
+            ),
+        )
+        test_user_secret.grant_read(user_setup_role)
+
         user_setup_fn = _lambda.Function(self, "UserSetupFn",
             runtime=_lambda.Runtime.PYTHON_3_12,
             handler="index.handler",
@@ -120,9 +140,10 @@ class MultiTenantDatabricksStack(Stack):
             service_token=provider.service_token,
             properties={
                 "UserPoolId": user_pool.user_pool_id,
+                "SecretArn": test_user_secret.secret_arn,
                 "Users": [
-                    {"email": "testuser@example.com", "tenant_id": "tenant-001", "password": "Workshop@123!"},
-                    {"email": "testuser2@example.com", "tenant_id": "tenant-002", "password": "Workshop@123!"},
+                    {"email": "testuser@example.com", "tenant_id": "tenant-001"},
+                    {"email": "testuser2@example.com", "tenant_id": "tenant-002"},
                 ],
             },
         )
@@ -225,6 +246,8 @@ class MultiTenantDatabricksStack(Stack):
             environment={
                 "WIF_CONFIG_TABLE": wif_config_table.table_name,
                 "DATABRICKS_HOST": databricks_host,
+                "COGNITO_USER_POOL_ID": user_pool.user_pool_id,
+                "COGNITO_CLIENT_ID": client.user_pool_client_id,
             },
         )
         wif_config_table.grant_read_data(interceptor_function)
@@ -256,8 +279,23 @@ class MultiTenantDatabricksStack(Stack):
                 iam.ManagedPolicy.from_aws_managed_policy_name("service-role/AWSLambdaBasicExecutionRole"),
             ],
         )
+        # Least-privilege gateway lifecycle permissions. Scoped to the
+        # gateway-related AgentCore action families (not the full
+        # "bedrock-agentcore:*"). CreateGateway internally creates a workload
+        # identity and credential-provider dependencies, so those action
+        # families are required alongside the gateway/target CRUD actions —
+        # this mirrors AWS's documented least-privilege gateway policy.
+        # Resource is "*" because CreateGateway has no pre-existing ARN and
+        # several of these dependency resources are account-scoped at create
+        # time.
         provider_role.add_to_policy(iam.PolicyStatement(
-            actions=["bedrock-agentcore:*"],
+            actions=[
+                "bedrock-agentcore:*Gateway*",
+                "bedrock-agentcore:*WorkloadIdentity",
+                "bedrock-agentcore:*CredentialProvider",
+                "bedrock-agentcore:*Token*",
+                "bedrock-agentcore:*Access*",
+            ],
             resources=["*"],
         ))
         provider_role.add_to_policy(iam.PolicyStatement(
@@ -386,11 +424,9 @@ class MultiTenantDatabricksStack(Stack):
             ),
         )
 
-        agent_endpoint = agentcore.CfnRuntimeEndpoint(self, "AgentContainerEndpoint",
-            agent_runtime_id=agent_runtime.attr_agent_runtime_id,
-            name="mt_databricks_agent_ep",
-            description="Invoke endpoint for multi-tenant Databricks agent",
-        )
+        # The runtime automatically provisions a DEFAULT endpoint, which is what
+        # callers invoke (see scripts/05_test_agent.sh, which uses ?qualifier=DEFAULT).
+        # No custom endpoint resource is needed.
 
         # ═══════════════════════════════════════════════════════════════
         # OUTPUTS
@@ -405,4 +441,4 @@ class MultiTenantDatabricksStack(Stack):
         CfnOutput(self, "QueryRoleName", value=query_role.role_name)
         CfnOutput(self, "InterceptorRoleName", value=interceptor_role.role_name)
         CfnOutput(self, "AgentRuntimeId", value=agent_runtime.attr_agent_runtime_id)
-        CfnOutput(self, "AgentEndpointArn", value=agent_endpoint.attr_agent_runtime_endpoint_arn)
+        CfnOutput(self, "TestUserPasswordSecretArn", value=test_user_secret.secret_arn)

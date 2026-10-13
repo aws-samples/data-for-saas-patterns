@@ -42,7 +42,7 @@ pip install -q \
   --only-binary=:all: \
   --no-compile \
   --target "$BUILD_DIR/interceptor-layer/python" \
-  PyJWT requests urllib3 certifi charset-normalizer idna 2>/dev/null
+  PyJWT cryptography requests urllib3 certifi charset-normalizer idna 2>/dev/null
 echo "    ✓ $(du -sh "$BUILD_DIR/interceptor-layer" | awk '{print $1}')"
 
 echo ""
