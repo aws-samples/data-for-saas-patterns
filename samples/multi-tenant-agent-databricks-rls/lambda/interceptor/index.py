@@ -22,6 +22,27 @@ _TABLE_NAME = os.environ.get("WIF_CONFIG_TABLE", "multi-tenant-databricks-wif-co
 _DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "")
 _REGION = os.environ.get("AWS_REGION", "us-east-1")
 
+# Cognito JWT verification config (defense in depth — see _extract_tenant_id).
+# The issuer is the standard Cognito user-pool issuer; the JWKS endpoint under it
+# serves the RS256 public keys used to verify the token signature.
+_USER_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
+_CLIENT_ID = os.environ.get("COGNITO_CLIENT_ID", "")
+_ISSUER = f"https://cognito-idp.{_REGION}.amazonaws.com/{_USER_POOL_ID}"
+_JWKS_URL = f"{_ISSUER}/.well-known/jwks.json"
+
+# Single, lazily-created JWKS client held at module scope. PyJWKClient fetches and
+# caches signing keys internally, so warm invocations reuse the cached keys and only
+# the first token on a cold start triggers a network fetch.
+_jwks_client = None
+
+
+def _get_jwks_client():
+    """Return the lazily-constructed, module-level PyJWKClient (one per execution env)."""
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = jwt.PyJWKClient(_JWKS_URL)
+    return _jwks_client
+
 _token_cache = {}  # {tenant_id: {"token": str, "expires_at": float}}
 # This in-memory cache works within a single Lambda execution environment (warm starts).
 # For production with many concurrent Lambda instances, consider ElastiCache (Redis)
@@ -122,11 +143,41 @@ def _error_response(status_code: int, request_id, message: str) -> dict:
 
 
 def _extract_tenant_id(auth_header: str) -> str:
-    """Decode JWT → custom:tenant_id (signature already verified by Gateway)."""
+    """Verify the Cognito JWT and extract custom:tenant_id.
+
+    The signature is verified here (defense in depth) rather than merely trusted
+    from the AgentCore Gateway: the extracted custom:tenant_id is the entire
+    multi-tenant isolation boundary, so the Lambda verifies the RS256 signature
+    against the Cognito JWKS plus the issuer and audience before using any claim.
+    """
     if not auth_header:
         raise ValueError("Authorization header missing")
     token = auth_header.replace("Bearer ", "").replace("bearer ", "")
-    claims = jwt.decode(token, options={"verify_signature": False})
+
+    # Fail closed on misconfiguration — never fall back to an unverified decode.
+    if not _USER_POOL_ID or not _CLIENT_ID:
+        raise ValueError(
+            "Interceptor misconfigured: COGNITO_USER_POOL_ID / COGNITO_CLIENT_ID not set"
+        )
+
+    # Resolve the RS256 signing key for this token from the Cognito JWKS.
+    signing_key = _get_jwks_client().get_signing_key_from_jwt(token).key
+
+    try:
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            # Cognito ID tokens carry the app client id in `aud`, and the sample's
+            # auth scripts use AuthenticationResult.IdToken, so verify aud == client id.
+            audience=_CLIENT_ID,
+            issuer=_ISSUER,
+            options={"require": ["exp", "iss", "aud"]},
+        )
+    except jwt.InvalidTokenError as e:
+        # Bad/expired/tampered tokens → ValueError → 401 (lambda_handler maps it).
+        raise ValueError(f"JWT verification failed: {e}")
+
     tenant_id = claims.get("custom:tenant_id", "")
     if not tenant_id:
         raise ValueError("JWT missing custom:tenant_id claim")

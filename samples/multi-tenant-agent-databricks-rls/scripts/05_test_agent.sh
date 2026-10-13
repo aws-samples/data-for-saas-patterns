@@ -13,7 +13,24 @@ set -euo pipefail
 
 REGION="${AWS_REGION:-us-east-1}"
 STACK_NAME="MultiTenantAgentDatabricks"
-TEST_PASSWORD="${TEST_PASSWORD:-Workshop@123!}"
+
+# Resolve the Cognito test-user password. Prefer an explicit TEST_PASSWORD env var;
+# otherwise fetch the auto-generated password from Secrets Manager via the stack output.
+TEST_PASSWORD="${TEST_PASSWORD:-}"
+if [[ -z "$TEST_PASSWORD" ]]; then
+  SECRET_ARN=$(aws cloudformation describe-stacks \
+    --stack-name "${STACK_NAME}" --region "$REGION" --no-cli-pager \
+    --query "Stacks[0].Outputs[?OutputKey=='TestUserPasswordSecretArn'].OutputValue" --output text)
+  if [[ -n "$SECRET_ARN" && "$SECRET_ARN" != "None" ]]; then
+    TEST_PASSWORD=$(aws secretsmanager get-secret-value \
+      --secret-id "$SECRET_ARN" --region "$REGION" --no-cli-pager \
+      --query SecretString --output text)
+  fi
+fi
+if [[ -z "$TEST_PASSWORD" || "$TEST_PASSWORD" == "None" ]]; then
+  echo "ERROR: Could not resolve test password. Set TEST_PASSWORD env var or ensure the stack output TestUserPasswordSecretArn exists." >&2
+  exit 1
+fi
 
 COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks \
   --stack-name "${STACK_NAME}" --region "$REGION" --no-cli-pager \

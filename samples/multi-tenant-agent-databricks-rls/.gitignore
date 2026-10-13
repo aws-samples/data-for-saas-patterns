@@ -12,9 +12,6 @@ __pycache__/
 cdk/cdk.out/
 cdk/.venv/
 
-# Agent
-agent/uv.lock
-
 # Environment
 .lab_env
 .env

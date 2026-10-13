@@ -125,6 +125,19 @@ create_sp() {
     sp_id=$(echo "$search_result" | python3 -c "import sys,json; r=json.load(sys.stdin).get('Resources',[]); print(r[0]['id'] if r else '')" 2>/dev/null)
   fi
 
+  # Grant the databricks-sql-access entitlement so the SP can call the SQL
+  # Statement Execution API. Without it, queries fail with HTTP 403:
+  # "This API is disabled for users without the databricks-sql-access or
+  # workspace-consume entitlements." Some workspaces grant this by default;
+  # others (e.g. newer workspaces) do not, so set it explicitly. Idempotent.
+  if [ -n "$sp_id" ] && [ "$sp_id" != "None" ]; then
+    curl -s -X PATCH "${DATABRICKS_HOST}/api/2.0/preview/scim/v2/ServicePrincipals/${sp_id}" \
+      -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"add","path":"entitlements","value":[{"value":"databricks-sql-access"}]}]}' \
+      > /dev/null 2>&1
+  fi
+
   echo "${app_id}:${sp_id}"
 }
 
