@@ -1,12 +1,13 @@
 """Per-org messaging migration: content leaves Postgres for S3, rows land with content_ref.
 
-The same code path runs the bulk pass and every delta pass. A per-org watermark on
-messages.id means re-runs pick up only new rows, and conditional PUTs mean re-runs never
-rewrite objects. Run a final pass during the org's write freeze at cutover.
+The same code path runs the bulk pass, every delta pass and the final pass at cutover. A
+per-org watermark on messages.id means re-runs pick up only new rows, and conditional PUTs
+mean re-runs never store a second copy of the same content.
 
-Source note: locally this reads V1 directly. In AWS the bulk pass should read the RDS
-snapshot export (Parquet in S3) so V1 production carries no load; deltas read a V1 read
-replica with a read-only migration user.
+Source note: locally this reads V1 directly. In AWS the bulk and delta passes can read a V1
+read replica (set V1_MESSAGING_READ_DSN), or the bulk pass can read an RDS snapshot export,
+so the V1 writer carries no load. The final pass and reconciliation always read the writer
+(V1_MESSAGING_DSN): replica lag at cutover would silently drop rows.
 """
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,9 +15,11 @@ from dataclasses import dataclass
 
 import psycopg
 
-from tenantmig import settings
+from tenantmig import placement, settings
 from tenantmig.hashing import Hasher, Sha256Hasher
 from tenantmig.store import ContentStore, org_bucket
+
+COLUMNS = "id, org_id, channel, sender, sent_at, created_at"
 
 
 @dataclass
@@ -28,27 +31,38 @@ class PassResult:
     bytes_written: int = 0
     seconds: float = 0.0
     watermark: int = 0
-    backfilled: int = 0          # rows found missing by the anti-join (final or repair pass)
+    backfilled: int = 0          # rows the cell was missing (final or repair pass)
+    recopied: int = 0            # rows re-copied because they differ from V1 (repair)
+    deleted_extras: int = 0      # cell rows whose V1 row is gone (repair)
+    held_back: int = 0           # rows inside the safety margin, left for the next pass
 
 
 def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = None,
                 store: ContentStore | None = None, final: bool = False, repair: bool = False) -> PassResult:
     """One pass for one tenant.
 
-    Normal (bulk or delta) passes copy rows after the watermark that are older than
-    DELTA_SAFETY_SECONDS, so a row whose lower id commits late isn't skipped by a watermark
-    that already moved past it. `final` (used by cutover, with writes frozen) drops the margin
-    and then anti-joins V1 against the cell to copy anything still missing. `repair` runs only
-    the anti-join, as the fix when reconciliation reports missing rows.
+    Normal (bulk and delta) passes copy rows after the watermark, holding back anything
+    created within DELTA_SAFETY_SECONDS and never advancing the watermark past a held-back
+    row, so a lower id that commits late is still picked up by the next pass.
+
+    `final` (used by cutover, with writes frozen) drops the margin, reads the V1 writer, and
+    then anti-joins V1 against the cell to copy anything still missing.
+
+    `repair` fixes what reconciliation reports: it backfills missing rows, re-copies rows that
+    differ from V1, and deletes cell rows whose V1 row is gone.
     """
+    placement.require_migratable(org_id, "run a content pass")
     hasher = hasher or Sha256Hasher()
     store = store or ContentStore()
     bucket = org_bucket(org_id)
     store.ensure_bucket(bucket)
     result = PassResult(org_id)
     started = time.monotonic()
+    # The final pass and repair must see every committed row, so they read the writer even
+    # when the delta passes are pointed at a replica.
+    src_dsn = settings.V1_MESSAGING_DSN if (final or repair) else settings.V1_MESSAGING_READ_DSN
 
-    with psycopg.connect(settings.V1_MESSAGING_DSN) as src, psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as dst:
+    with psycopg.connect(src_dsn) as src, psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as dst:
         org = src.execute("SELECT id, name, created_at FROM organisations WHERE id = %s", (org_id,)).fetchone()
         if org is None:
             raise ValueError(f"org {org_id} not found in V1")
@@ -62,14 +76,26 @@ def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = No
         ).fetchone()[0]
         dst.commit()
 
-        margin = 0 if final else settings.DELTA_SAFETY_SECONDS
         if not repair:
+            # Hold back rows still inside the safety margin, and stop the watermark below the
+            # lowest of them: ids are not committed in order, so advancing past a held-back row
+            # would skip it for good. The final pass has writes frozen and uses no margin.
+            margin = 0 if final else settings.DELTA_SAFETY_SECONDS
+            ceiling = None
+            if margin:
+                row = src.execute(
+                    "SELECT min(id), count(*) FROM messages "
+                    "WHERE org_id = %s AND created_at >= now() - make_interval(secs => %s)",
+                    (org_id, margin)).fetchone()
+                if row[0] is not None:
+                    ceiling, result.held_back = row[0] - 1, row[1]
+
             with src.cursor(name="msgs") as cur:          # server-side cursor: constant memory
                 cur.itersize = batch_size
                 cur.execute(
-                    "SELECT id, org_id, channel, sender, sent_at, created_at, content FROM messages "
-                    "WHERE org_id = %s AND id > %s AND created_at < now() - make_interval(secs => %s) ORDER BY id",
-                    (org_id, watermark, margin),
+                    f"SELECT {COLUMNS}, content FROM messages WHERE org_id = %s AND id > %s "
+                    "AND (%s::bigint IS NULL OR id <= %s) ORDER BY id",
+                    (org_id, watermark, ceiling, ceiling),
                 )
                 batch = []
                 for row in cur:
@@ -81,7 +107,8 @@ def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = No
                     watermark = _flush(org_id, batch, bucket, hasher, store, dst, result)
 
         if final or repair:
-            watermark = max(watermark, _backfill_missing(org_id, src, dst, bucket, hasher, store, result, batch_size))
+            watermark = max(watermark, _repair(org_id, src, dst, bucket, hasher, store, result, batch_size,
+                                               full=repair))
 
         dst.execute("UPDATE migration.org_state SET passes = passes + 1, updated_at = now() WHERE org_id = %s",
                     (org_id,))
@@ -114,7 +141,7 @@ def _flush(org_id, batch, bucket, hasher: Hasher, store: ContentStore, dst, resu
                 result.objects_deduped += 1
 
     with dst.cursor().copy(
-        "COPY messages (id, org_id, channel, sender, sent_at, created_at, content_ref) FROM STDIN"
+        f"COPY messages ({COLUMNS}, content_ref) FROM STDIN"
     ) as copy:
         for r in rows:
             copy.write_row(r)
@@ -127,22 +154,52 @@ def _flush(org_id, batch, bucket, hasher: Hasher, store: ContentStore, dst, resu
     return batch[-1][0]
 
 
-def _backfill_missing(org_id, src, dst, bucket, hasher: Hasher, store: ContentStore, result: PassResult,
-                      batch_size: int, range_size: int = 100_000) -> int:
-    """Anti-join, one id range at a time: copy every V1 row for the tenant that the cell lacks."""
+def _repair(org_id, src, dst, bucket, hasher: Hasher, store: ContentStore, result: PassResult,
+            batch_size: int, full: bool, range_size: int = 100_000) -> int:
+    """Converge the cell on V1 for this tenant, one id range at a time.
+
+    Always: copy V1 rows the cell is missing (the anti-join the final pass needs).
+    With full=True (`--repair`): also re-copy rows whose V1 values differ from the cell's, and
+    delete cell rows whose V1 row is gone. Those are the cases a watermark can never fix,
+    because V1 changed under rows that were already copied.
+    """
     lo, hi = src.execute("SELECT coalesce(min(id), 0), coalesce(max(id), -1) FROM messages WHERE org_id = %s",
                          (org_id,)).fetchone()
+    if full:
+        # Extras can sit outside V1's id span entirely (a deleted lowest or highest row), so
+        # the scan has to cover the union of both sides or it would never see them.
+        clo, chi = dst.execute("SELECT coalesce(min(id), %s), coalesce(max(id), -1) FROM messages "
+                               "WHERE org_id = %s", (lo, org_id)).fetchone()
+        lo, hi = min(lo, clo), max(hi, chi)
     top = 0
     for start in range(lo, hi + 1, range_size):
         end = start + range_size
-        have = {r[0] for r in dst.execute("SELECT id FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
-                                          (org_id, start, end))}
-        ids = [r[0] for r in src.execute("SELECT id FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
-                                         (org_id, start, end)) if r[0] not in have]
-        for i in range(0, len(ids), batch_size):
-            chunk = ids[i:i + batch_size]
-            batch = src.execute("SELECT id, org_id, channel, sender, sent_at, created_at, content FROM messages "
-                                "WHERE id = ANY(%s) ORDER BY id", (chunk,)).fetchall()
-            top = max(top, _flush(org_id, batch, bucket, hasher, store, dst, result))
-            result.backfilled += len(batch)
+        v1 = {r[0]: r[1:] for r in src.execute(
+            f"SELECT {COLUMNS} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+            (org_id, start, end))}
+        cell = {r[0]: r[1:] for r in dst.execute(
+            f"SELECT {COLUMNS} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+            (org_id, start, end))}
+
+        ids = sorted(set(v1) - set(cell))
+        changed = sorted(i for i in set(v1) & set(cell) if full and v1[i] != cell[i]) if full else []
+        extras = sorted(set(cell) - set(v1)) if full else []
+
+        if extras:
+            dst.execute("DELETE FROM messages WHERE org_id = %s AND id = ANY(%s)", (org_id, extras))
+            dst.commit()
+            result.deleted_extras += len(extras)
+        if changed:
+            dst.execute("DELETE FROM messages WHERE org_id = %s AND id = ANY(%s)", (org_id, changed))
+            dst.commit()
+            result.recopied += len(changed)
+
+        todo = sorted(ids + changed)
+        for i in range(0, len(todo), batch_size):
+            chunk = todo[i:i + batch_size]
+            batch = src.execute(f"SELECT {COLUMNS}, content FROM messages WHERE org_id = %s AND id = ANY(%s) "
+                                "ORDER BY id", (org_id, chunk)).fetchall()
+            if batch:
+                top = max(top, _flush(org_id, batch, bucket, hasher, store, dst, result))
+        result.backfilled += len(ids)
     return top

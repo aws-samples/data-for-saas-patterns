@@ -1,21 +1,30 @@
-"""Step 8: copy an org's existing objects from the V1 shared bucket into its V2 bucket.
+"""Step 7: copy an org's existing objects from the V1 shared bucket into its V2 bucket.
 
 AWS: S3 Batch Operations Copy, one job per org, driven by a manifest of the org's prefix.
-In production build the manifest from S3 Inventory (filtered by org prefix) instead of
-listing, since the shared bucket holds ~6 billion objects. Local MinIO has no Batch
-Operations, so the same copy is done directly.
+In production build the manifest from S3 Inventory (filtered by the org prefix) rather than
+by listing: a shared bucket in a large estate can hold billions of objects, and listing them
+all is slow and expensive. Local MinIO has no Batch Operations, so the copy is done directly.
 
-Watch-outs at scale: copied Intelligent-Tiering objects restart in Frequent Access;
-Glacier Deep Archive objects must be restored first; Batch Operations copies objects up
-to 5 GB (larger ones need multipart copy).
+Only objects the destination is missing go into the manifest, so a re-run (and the re-check
+during cutover) costs one LIST rather than a full re-copy.
+
+Watch-outs at scale:
+- A copy lands in the destination bucket's default storage class unless the job sets one.
+  If you do set S3 Intelligent-Tiering, monitoring starts again from the Frequent Access
+  tier, so objects that had aged into an archive tier are billed at Frequent Access rates
+  until they age down again.
+- Objects in S3 Glacier Flexible Retrieval or Deep Archive, and in the Intelligent-Tiering
+  archive tiers, must be restored before they can be copied.
+- Batch Operations copies objects up to 5 GB; larger ones need a multipart copy.
 """
 import csv
 import io
 import time
+from urllib.parse import quote
 
 from botocore.exceptions import ClientError
 
-from tenantmig import settings
+from tenantmig import placement, settings
 from tenantmig.store import ContentStore, org_bucket
 
 DEST_PREFIX = "originals/"
@@ -29,39 +38,43 @@ def _source_keys(store: ContentStore, org_id: str) -> list[tuple[str, str]]:
 
 
 def migrate_objects(org_id: str, store: ContentStore | None = None) -> dict:
+    placement.require_migratable(org_id, "copy shared-bucket objects")
     store = store or ContentStore()
     dest = org_bucket(org_id)
     store.ensure_bucket(dest)
     keys = _source_keys(store, org_id)
     if not keys:
         return {"org_id": org_id, "source_objects": 0, "mode": "none"}
+    # Copy only what the destination lacks: one LIST instead of re-copying everything.
+    already = store.list_keys(dest, prefix=DEST_PREFIX)
+    todo = [(k, e) for k, e in keys if DEST_PREFIX + k not in already]
+    if not todo:
+        return {"org_id": org_id, "mode": "up to date", "source_objects": len(keys),
+                "already_present": len(keys), "copied": 0}
     if settings.S3_ENDPOINT_URL:
-        return _copy_direct(store, org_id, dest, keys)
-    return _copy_batch_operations(store, org_id, dest, keys)
+        return _copy_direct(store, org_id, dest, todo, len(keys))
+    return _copy_batch_operations(store, org_id, dest, todo, len(keys))
 
 
-def _copy_direct(store, org_id, dest, keys) -> dict:
-    copied = skipped = 0
-    for key, _ in keys:
-        target = DEST_PREFIX + key
-        try:
-            store.s3.head_object(Bucket=dest, Key=target)
-            skipped += 1
-            continue
-        except ClientError:
-            pass
-        store.s3.copy_object(Bucket=dest, Key=target, CopySource={"Bucket": settings.V1_SHARED_BUCKET, "Key": key})
+def _copy_direct(store, org_id, dest, todo, source_total) -> dict:
+    copied = 0
+    for key, _ in todo:
+        store.s3.copy_object(Bucket=dest, Key=DEST_PREFIX + key,
+                             CopySource={"Bucket": settings.V1_SHARED_BUCKET, "Key": key})
         copied += 1
-    return {"org_id": org_id, "mode": "direct (local)", "source_objects": len(keys), "copied": copied, "skipped": skipped}
+    return {"org_id": org_id, "mode": "direct (local)", "source_objects": source_total,
+            "already_present": source_total - len(todo), "copied": copied}
 
 
-def _copy_batch_operations(store, org_id, dest, keys) -> dict:
+def _copy_batch_operations(store, org_id, dest, todo, source_total) -> dict:
     import boto3
     manifest_key = f"_manifests/{org_id}/{int(time.time())}.csv"
     buf = io.StringIO()
     w = csv.writer(buf)
-    for key, _ in keys:
-        w.writerow([settings.V1_SHARED_BUCKET, key])
+    for key, _ in todo:
+        # Batch Operations requires URL-encoded object keys in a CSV manifest. Without this,
+        # keys containing a space, +, % or any non-ASCII character fail their task.
+        w.writerow([settings.V1_SHARED_BUCKET, quote(key, safe="")])
     # A manually created Batch Operations manifest can't be SSE-KMS (only S3 Inventory reports can),
     # so the manifest (bucket/key pairs) is written with SSE-S3, overriding the bucket's KMS default.
     # Copied objects still use the cell key.
@@ -98,12 +111,20 @@ def _copy_batch_operations(store, org_id, dest, keys) -> dict:
         if d["Status"] in ("Complete", "Failed", "Cancelled"):
             break
         if time.monotonic() > deadline:
+            # Cancel it: an abandoned job keeps copying (and billing) after we stop looking.
+            try:
+                s3control.update_job_status(AccountId=settings.ACCOUNT_ID, JobId=job_id,
+                                            RequestedJobStatus="Cancelled",
+                                            StatusUpdateReason="tenantmig timeout")
+            except ClientError:
+                pass                  # already terminal, or not cancellable: report the timeout
             raise TimeoutError(f"Batch Operations job {job_id} still {d['Status']} after "
-                               f"{settings.BATCH_TIMEOUT_SECONDS}s")
+                               f"{settings.BATCH_TIMEOUT_SECONDS}s (cancellation requested)")
         time.sleep(10)
     p = d.get("ProgressSummary", {})
     result = {"org_id": org_id, "mode": "S3 Batch Operations", "job_id": job_id, "status": d["Status"],
-              "source_objects": len(keys), "succeeded": p.get("NumberOfTasksSucceeded"),
+              "source_objects": source_total, "already_present": source_total - len(todo),
+              "copied": p.get("NumberOfTasksSucceeded"), "succeeded": p.get("NumberOfTasksSucceeded"),
               "failed": p.get("NumberOfTasksFailed"), "failure_reasons": d.get("FailureReasons", [])}
     if d["Status"] != "Complete" or (p.get("NumberOfTasksFailed") or 0) > 0:
         raise RuntimeError(f"Batch Operations copy failed for {org_id}: {result}. Failed tasks are listed under "

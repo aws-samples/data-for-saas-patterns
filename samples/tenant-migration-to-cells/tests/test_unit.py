@@ -20,13 +20,13 @@ def test_identical_content_shares_one_object_key():
 
 
 def test_old_model_wildcard_allow():
-    assert _old_decision([("*", "*", "allow")], "mailbox", "read")
+    assert _old_decision([("*", "*", "allow")], "record", "read")
 
 
 def test_old_model_deny_wins_over_allow():
-    perms = [("*", "read", "allow"), ("audit_log", "read", "deny")]
-    assert _old_decision(perms, "mailbox", "read")
-    assert not _old_decision(perms, "audit_log", "read")
+    perms = [("*", "read", "allow"), ("activity_log", "read", "deny")]
+    assert _old_decision(perms, "record", "read")
+    assert not _old_decision(perms, "activity_log", "read")
 
 
 def test_old_model_wildcard_deny_beats_specific_allow():
@@ -49,8 +49,11 @@ def test_dsn_from_parts_escapes_password(monkeypatch):
         assert settings.V1_MESSAGING_DSN.startswith("postgresql://postgres:p%40ss%2Fw%3Ard@db.example.internal:5432/")
         assert settings.V1_MESSAGING_DSN.endswith("sslmode=require")
         assert settings.FDW_V1_MESSAGING["port"] == "5432"
-        assert settings.FDW_V1_MESSAGING["reader_user"] == "tenantmig_reader"    # never the master user
-        assert "password" not in settings.FDW_V1_MESSAGING
+        # The fdw must never be handed the V1 master password: it gets the reader's.
+        assert settings.FDW_V1_MESSAGING["reader_user"] == "tenantmig_reader"
+        assert settings.FDW_V1_MESSAGING["reader_password"] == settings.READER_PASSWORD
+        assert "p@ss/w:rd" not in str(settings.FDW_V1_MESSAGING)
+        assert not any(k for k in settings.FDW_V1_MESSAGING if k in ("user", "password"))
     finally:
         monkeypatch.undo()
         importlib.reload(settings)                      # don't leak the patched settings into other tests

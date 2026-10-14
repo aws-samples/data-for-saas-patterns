@@ -21,12 +21,20 @@ def _dsn(prefix: str, port: int, dbname: str) -> str:
 
 V1_MESSAGING_DSN = _dsn("V1_MESSAGING", 5415, "messaging")
 V1_AUTH_DSN = _dsn("V1_AUTH", 5416, "auth")
+# Bulk and delta passes may read a replica. The final pass at cutover, repair and
+# reconciliation always use V1_MESSAGING_DSN (the writer): replica lag would drop rows.
+V1_MESSAGING_READ_DSN = os.getenv("V1_MESSAGING_READ_DSN") or V1_MESSAGING_DSN
 V2_CELL_MESSAGING_DSN = _dsn("V2_CELL_MESSAGING", 5418, "messaging")
 V2_MANAGEMENT_DSN = _dsn("V2_MANAGEMENT", 5419, "management")
 
 
 READER_USER = "tenantmig_reader"
 READER_PASSWORD = os.getenv("TENANTMIG_READER_PASSWORD", "local-reader")
+# postgres_fdw needs sslmode=verify-full plus a CA to authenticate the server. The fdw client
+# is the management database instance itself, not this process, so this has to name something
+# that instance can read: "system" uses its trust store (PostgreSQL 16+), which on Aurora
+# carries the Amazon RDS CA. A file path here would have to exist on the database host.
+FDW_SSLROOTCERT = os.getenv("FDW_SSLROOTCERT")
 
 
 def _fdw(prefix: str, local_port: int, dbname: str) -> dict:
@@ -39,7 +47,8 @@ def _fdw(prefix: str, local_port: int, dbname: str) -> dict:
         # The fdw connects as the read-only migration role, never as the master user.
         reader_user=READER_USER,
         reader_password=READER_PASSWORD,
-        sslmode=os.getenv(f"{prefix}_SSLMODE", "require" if os.getenv(f"{prefix}_HOST") else "disable"),
+        sslmode=os.getenv(f"FDW_{prefix}_SSLMODE") or os.getenv(
+            f"{prefix}_SSLMODE", "require" if os.getenv(f"{prefix}_HOST") else "disable"),
     )
 
 
@@ -52,6 +61,9 @@ S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "local") if S3_ENDPOINT_URL else None
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "localsecret") if S3_ENDPOINT_URL else None
 S3_REGION = os.getenv("AWS_REGION", "us-east-2")
 ORG_BUCKET_PREFIX = os.getenv("ORG_BUCKET_PREFIX", "tm-org-")
+# Every S3 call passes this as ExpectedBucketOwner, so a bucket pre-created in someone
+# else's account under a guessable name can never be written to. Set by the CDK stack.
+EXPECTED_BUCKET_OWNER = os.getenv("EXPECTED_BUCKET_OWNER") or os.getenv("ACCOUNT_ID")
 # Concurrent S3 PUTs per batch. Per-object latency, not bandwidth, dominates small-object copies.
 S3_WORKERS = int(os.getenv("S3_WORKERS", "32"))
 # V1 shared bucket (one bucket, org UUID prefix) and S3 Batch Operations wiring for step 8.
@@ -67,8 +79,13 @@ DELTA_SAFETY_SECONDS = int(os.getenv("DELTA_SAFETY_SECONDS", "60"))
 # How long the router may serve a cached tenant_placement. Cutover waits this long after
 # freezing, so writes accepted before the cache refreshed land before the final pass.
 PLACEMENT_CACHE_TTL_SECONDS = int(os.getenv("PLACEMENT_CACHE_TTL_SECONDS", "30"))
-# reset and purge-buckets delete data; they only run where this is set (local stack, sandbox).
+# generate, init, reset and purge-buckets change or delete data; they only run where this
+# is set (the local stack and the CDK task set it).
 SANDBOX = os.getenv("TENANTMIG_SANDBOX") == "1"
+# Cutover checks that each connector's secret_ref resolves in Secrets Manager before it
+# redirects. Off by default: the local stack has no Secrets Manager, and the check needs
+# secretsmanager:DescribeSecret.
+CHECK_CONNECTOR_SECRETS = os.getenv("CHECK_CONNECTOR_SECRETS") == "1"
 # The cell this sample migrates tenants into.
 CELL_ID = os.getenv("CELL_ID", "cell-1")
 # In AWS, per-org buckets are encrypted with this cell KMS key.

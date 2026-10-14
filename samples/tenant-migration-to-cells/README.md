@@ -6,7 +6,7 @@ The target schema is not like-for-like: message content moves out of PostgreSQL 
 
 It implements the **Clone → Flip → Redirect → Forget** sequence from [Cell migration](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-migration.html) in the AWS Well-Architected guidance on cell-based architecture. See the [reference architecture](../../reference-architectures/tenant-migration-to-cells.md) for the pattern, and [Scale your relational database for SaaS, Part 2](https://aws.amazon.com/blogs/database/scale-your-relational-database-for-saas-part-2-sharding-and-routing/) for why tenant migration belongs in a sharded or cellular SaaS architecture.
 
-![Architecture](docs/tenant-migration-to-cells.png)
+![Architecture](docs/tenant-migration-pattern.png)
 
 **New here? Read the [complete guide](docs/GUIDE.md).** It covers concepts, a walkthrough, how each step works, a production cutover runbook, scale and cost, security, and troubleshooting.
 
@@ -19,9 +19,9 @@ All data is synthetic.
 | 1–3 | Messaging rows with inline `content` | Content job: hash the content, write it to S3 only if the key is absent, `COPY` the row with `content_ref` | Cell messaging database + per-tenant bucket |
 | 4 | New V1 rows after the bulk pass | The same job, re-run from a per-tenant watermark (rows older than a safety margin). The final pass at cutover adds an anti-join, so late commits aren't lost | Same |
 | 5 | Auth (users, roles, permissions) + platform configuration | SQL over [`postgres_fdw`](https://docs.aws.amazon.com/prescriptive-guidance/latest/aurora-postgresql-integration/remote-postgresql-databases.html), connecting as a read-only role: wildcards expanded against the application catalogue, denies subtracted, changes and deletions converged, credentials replaced by an [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) reference | Management database |
-| 6 | — | Permissions diff harness: V1 and V2 answer the same questions independently, and every disagreement is listed | — |
-| 8 | Shared bucket, objects under the tenant prefix | [S3 Batch Operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-examples-copy.html) Copy, one job per tenant (a direct copy when run locally) | Per-tenant bucket, `originals/` |
-| 9 | — | Reconciliation: row counts, checksums, every `content_ref` resolves, sample round-trip, every shared object copied | — |
+| 6 | — | Permissions diff harness: V1 and V2 answer the same questions independently, over the application catalogue, and every disagreement is listed | — |
+| 7 | Shared bucket, objects under the tenant prefix | [S3 Batch Operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-examples-copy.html) Copy, one job per tenant (a direct copy when run locally) | Per-tenant bucket, `originals/` |
+| 8 | — | Reconciliation: row counts, checksums, every `content_ref` resolves, sample round-trip, every shared object copied | — |
 | Flip + Redirect | — | `cutover`: refuses unless the tenant is on V1, freezes its writes, drains router caches, runs a final delta, re-verifies, then routes it to the cell. Rolls back to V1 on any failure or exception | `tenant_placement` |
 | Forget | Tenant's V1 rows and objects | `forget`: dry run, then `--confirm`. Refuses unless the tenant is cut over | — |
 
@@ -29,7 +29,7 @@ The demo verifies the tenant (`READY TO CUT OVER`, or `NOT READY TO CUT OVER` wi
 
 Points to note in the design:
 
-* **[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) (`If-None-Match`) do the deduplication.** Identical content is stored once, and re-running a pass never rewrites or re-pays for an object.
+* **[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) (`If-None-Match`) do the deduplication.** Identical content is stored once, and re-running a pass never stores a second copy. (A rejected conditional PUT is still a billed request, so a re-run is cheap, not free.)
 * **Objects are written before rows, and rows commit together with the watermark.** A row never points at missing content, and a pass that crashes resumes from its last committed batch. An advisory lock allows one pass per tenant at a time.
 * **The permissions harness doesn't reuse the transform.** It evaluates the V1 model in its own code, over the same application catalogue, so a bug in the transform can't hide itself. Run the demo with `--inject-bug` to see it catch one.
 * **Credentials can't travel the migration path.** The fdw sees only declared columns, without `credentials`, and connects as a read-only role that can't select them.
@@ -39,20 +39,21 @@ Points to note in the design:
 
 * Python 3.11+ and [uv](https://docs.astral.sh/uv/)
 * To run locally: PostgreSQL 15 and 18, and MinIO (for example `brew install postgresql@15 postgresql@18 minio`), or Docker
-* To run on AWS: Node.js 18+, the AWS CDK v2, and credentials for a sandbox account
+* To run on AWS: Node.js 22+, the AWS CDK v2, and credentials for a sandbox account
 
 ## Run locally
 
 ```bash
 uv venv && uv pip install -e .
 ./scripts/local-up.sh && source .local/env      # sets TENANTMIG_SANDBOX=1 and creates the reader role
-# or: docker compose up -d && export TENANTMIG_SANDBOX=1 && tenantmig init
+# or with Docker:
+#   docker compose up -d && source scripts/docker.env && tenantmig init
 
 tenantmig demo                 # end to end for one tenant (resets the V2 targets: needs TENANTMIG_SANDBOX=1)
 tenantmig demo --inject-bug    # seeds a permissions bug that the harness must catch
 ```
 
-Tests: `uv pip install pytest && python -m pytest tests` runs the 7 unit tests, which need no database. Add `TENANTMIG_INTEGRATION=1` with the local stack running for the 14 integration tests. They cover crash and re-run, late commits, the catalogue and permissions, config convergence, credential isolation, cutover, rollback, refusals and forget.
+Tests: `uv pip install pytest && python -m pytest tests` runs the 7 unit tests, which need no database. Add `TENANTMIG_INTEGRATION=1` with the local stack running for the 24 integration tests. They cover crash and re-run, late commits held back by the safety margin, repair of deleted and edited rows, the application catalogue, config convergence, credential isolation and rotation, concurrency, the sandbox guards, cutover, rollback on failure and on interruption, refusals, and forget.
 
 Individual steps: `tenantmig orgs`, `migrate-content <org>`, `migrate-config <org>`, `migrate-objects <org>`, `diff-permissions <org>`, `reconcile <org>`, `migrate-content <org> --repair`, `cutover <org> [--drain-seconds N]`, `where <org>`, `forget <org> [--confirm]`, `reset`, `purge-buckets`.
 
@@ -105,8 +106,8 @@ These are placeholders. Each is a single file to change.
 At production scale:
 
 * Build manifests from [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) rather than by listing.
-* Copied [S3 Intelligent-Tiering](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html) objects restart in Frequent Access.
-* [Restore](https://docs.aws.amazon.com/AmazonS3/latest/userguide/restoring-objects.html) S3 Glacier Deep Archive objects first.
+* A copy lands in the destination bucket's default storage class unless the job sets one. If you set [S3 Intelligent-Tiering](https://docs.aws.amazon.com/AmazonS3/latest/userguide/intelligent-tiering-overview.html), monitoring restarts at Frequent Access and objects under 128 KB never auto-tier.
+* [Restore](https://docs.aws.amazon.com/AmazonS3/latest/userguide/restoring-objects.html) archived objects first: S3 Glacier Flexible Retrieval and Deep Archive, and the Intelligent-Tiering archive tiers.
 * S3 Batch Operations copies objects up to 5 GB ([larger objects](https://repost.aws/knowledge-center/s3-batch-operations-copy)).
 * Throttle loads into cells that are already serving traffic.
 

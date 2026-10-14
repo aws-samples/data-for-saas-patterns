@@ -48,4 +48,17 @@ def diff_org(org_id: str) -> dict:
     known = set(itertools.product(users, resources, actions))
     for uid, res, act in sorted(granted - known):
         disagreements.append({"user_id": uid, "resource": res, "action": act, "v1": "deny", "v2": "allow"})
-    return {"org_id": org_id, "decisions_checked": checked, "disagreements": disagreements}
+
+    # A V1 rule naming something the catalogue doesn't list is dropped silently by the
+    # transform, and the comparison above can't see it either: both sides only ever ask about
+    # catalogue entries. Report it as a gap, so an incomplete catalogue blocks cutover rather
+    # than quietly losing access.
+    uncatalogued = sorted(
+        {("resource", r) for _, r, _, _ in rows if r != "*" and r not in set(resources)} |
+        {("action", a) for _, _, a, _ in rows if a != "*" and a not in set(actions)})
+    for kind, name in uncatalogued:
+        disagreements.append({"user_id": None, "resource": name if kind == "resource" else "*",
+                              "action": name if kind == "action" else "*",
+                              "v1": "rule exists", "v2": f"{kind} missing from the application catalogue"})
+    return {"org_id": org_id, "decisions_checked": checked, "disagreements": disagreements,
+            "uncatalogued": [f"{k}: {n}" for k, n in uncatalogued]}

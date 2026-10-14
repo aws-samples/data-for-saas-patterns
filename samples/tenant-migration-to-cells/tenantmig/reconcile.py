@@ -7,6 +7,10 @@
    say where a mismatch is.
 3. Every content_ref resolves to an object in the org's bucket.
 4. A sample of objects round-trips: S3 body == V1 content.
+5. Every object in the tenant's V1 shared prefix was copied.
+
+Reads the V1 **writer** (V1_MESSAGING_DSN), never a replica: replica lag would make a missing
+row look like a matching count.
 """
 
 import psycopg
@@ -17,9 +21,14 @@ from tenantmig.store import ContentStore, org_bucket
 
 RANGE_SIZE = 50_000      # ids per checksum range; about 5 MB of text per aggregate at 100 bytes a row
 
+# to_char with an explicit pattern, not extract(epoch)::text: the text form of a double
+# changed in PostgreSQL 12, so a legacy V1 and a modern cell would disagree on identical data.
 CHECKSUM = """
 SELECT id / %(rs)s AS range_no, count(*), md5(string_agg(
-    id || '|' || channel || '|' || sender || '|' || extract(epoch FROM sent_at)::text || '|' || {ref},
+    id || '|' || channel || '|' || sender
+       || '|' || to_char(sent_at   AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')
+       || '|' || to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US')
+       || '|' || {ref},
     ',' ORDER BY id))
 FROM messages WHERE org_id = %(org)s GROUP BY 1
 """

@@ -1,14 +1,20 @@
 """tenantmig: run the per-organisation V1 -> V2 migration steps."""
 import argparse
 import json
+import signal
 
 import psycopg
 
-from tenantmig import config_job, content_job, cutover, object_job, perm_diff, reconcile, settings, synthetic
+from tenantmig import (config_job, content_job, cutover, object_job, perm_diff, placement, reconcile,
+                       settings, synthetic)
 
 
 def _print(obj) -> None:
     print(json.dumps(obj, indent=2, default=str))
+
+
+def _on_sigterm(signum, frame):
+    raise SystemExit(f"terminated by signal {signum}")
 
 
 def wake(attempts: int = 12, delay: float = 10.0) -> None:
@@ -34,7 +40,14 @@ def _orgs() -> list[str]:
 
 
 def init_schemas() -> list[str]:
-    """Apply sql/ to each database that doesn't have its schema yet (used in AWS; local-up does this locally)."""
+    """Create the sample's schemas, catalogue and read-only role.
+
+    This WRITES TO THE V1 DATABASES: it creates the catalogue tables, creates the
+    `tenantmig_reader` role and sets its password, and grants it SELECT. That is why it is
+    guarded like the destructive commands. A production team applies its own schema and
+    creates the reader role from `tenantmig/reader.sql` by hand instead.
+    """
+    _require_sandbox("create schemas and the reader role (this writes to V1)")
     import os
     from pathlib import Path
     sql_dir = Path(os.getenv("SQL_DIR", Path(__file__).resolve().parent.parent / "sql"))
@@ -147,10 +160,10 @@ def demo(args) -> None:
     _print({**d, "disagreements": d["disagreements"][:10], "disagreement_count": len(d["disagreements"])})
     blocked = len(d["disagreements"])
 
-    print("\n== Step 8: existing shared-bucket objects -> org bucket")
+    print("\n== Step 7: existing shared-bucket objects -> org bucket")
     _print(object_job.migrate_objects(org))
 
-    print("\n== Step 9: reconciliation")
+    print("\n== Step 8: reconciliation")
     r = reconcile.reconcile_org(org)
     _print(r)
     if not r["passed"] or blocked:
@@ -176,14 +189,14 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="tenantmig", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    g = sub.add_parser("generate", help="create synthetic V1 data")
+    g = sub.add_parser("generate", help="replace V1 with synthetic data (TENANTMIG_SANDBOX=1 only)")
     g.add_argument("--orgs", type=int, default=3)
     g.add_argument("--messages", type=int, default=2_000)
 
     sub.add_parser("orgs", help="list V1 organisations")
     sub.add_parser("reset", help="empty V2 targets and delete per-tenant buckets (TENANTMIG_SANDBOX=1 only)")
     sub.add_parser("purge-buckets", help="delete every bucket the sample created, before cdk destroy (sandbox only)")
-    sub.add_parser("init", help="create schemas in empty databases (AWS sandbox)")
+    sub.add_parser("init", help="create schemas, catalogue and reader role; writes to V1 (sandbox only)")
     for name in ("migrate-content", "migrate-config", "migrate-objects", "diff-permissions", "reconcile"):
         sp = sub.add_parser(name)
         sp.add_argument("org_id")
@@ -195,7 +208,8 @@ def main() -> None:
 
     co = sub.add_parser("cutover", help="Flip + Redirect: freeze, final delta, verify, route to the cell")
     co.add_argument("org_id")
-    co.add_argument("--cell", default=None)
+    co.add_argument("--cell", default=None,
+                    help="cell label to record (the rows go to V2_CELL_MESSAGING_DSN regardless)")
     co.add_argument("--drain-seconds", type=int, default=None,
                     help="wait after freezing (default PLACEMENT_CACHE_TTL_SECONDS): your router's cache TTL")
     w = sub.add_parser("where", help="show where the router sends a tenant, with history")
@@ -210,6 +224,11 @@ def main() -> None:
     d.add_argument("--inject-bug", action="store_true")
 
     a = p.parse_args()
+    # A stopped Fargate task gets SIGTERM. Without this it dies silently and a cutover in
+    # flight would leave the tenant frozen; as SystemExit, cutover's handler unfreezes first.
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    if getattr(a, "org_id", None):
+        a.org_id = placement.normalise_org_id(a.org_id)
     wake()
     if a.cmd == "generate":
         _print(synthetic.generate(orgs=a.orgs, messages_per_org=a.messages))

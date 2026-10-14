@@ -13,7 +13,7 @@
 import psycopg
 from psycopg import sql
 
-from tenantmig import settings
+from tenantmig import placement, settings
 
 # Only these tables (and columns) are visible through the foreign-data wrapper.
 FOREIGN_TABLES = {
@@ -60,31 +60,51 @@ WHERE any_allow AND NOT coalesce(any_deny, false)
 
 
 def _ensure_fdw(conn) -> None:
+    """Create or refresh the foreign servers, user mappings and foreign tables.
+
+    Idempotent and safe to run from several tenants at once: one advisory lock serialises the
+    whole block, because `CREATE SCHEMA IF NOT EXISTS` and friends still race each other.
+
+    The mapping is refreshed on every run, so a rotated reader password takes effect. The
+    foreign tables are dropped and recreated, so an install from an older version of this
+    sample cannot keep a wider column list (for example one that still exposes `credentials`).
+    """
+    conn.execute("SELECT pg_advisory_xact_lock(hashtext('tenantmig:fdw'))")
     for schema, tables in FOREIGN_TABLES.items():
         server, opts = SERVERS[schema]
         conn.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+        options = [("host", opts["host"]), ("port", str(opts["port"])), ("dbname", opts["dbname"]),
+                   ("sslmode", opts["sslmode"])]
+        if settings.FDW_SSLROOTCERT:
+            options.append(("sslrootcert", settings.FDW_SSLROOTCERT))
+        opts_sql = sql.SQL(", ").join(sql.SQL("{} {}").format(sql.SQL(k), sql.Literal(v)) for k, v in options)
         if not conn.execute("SELECT 1 FROM pg_foreign_server WHERE srvname = %s", (server,)).fetchone():
-            conn.execute(sql.SQL("CREATE SERVER {} FOREIGN DATA WRAPPER postgres_fdw "
-                                 "OPTIONS (host {}, port {}, dbname {}, sslmode {})").format(
-                sql.Identifier(server), sql.Literal(opts["host"]), sql.Literal(str(opts["port"])),
-                sql.Literal(opts["dbname"]), sql.Literal(opts["sslmode"])))
+            conn.execute(sql.SQL("CREATE SERVER {} FOREIGN DATA WRAPPER postgres_fdw OPTIONS ({})").format(
+                sql.Identifier(server), opts_sql))
             conn.execute(sql.SQL("CREATE USER MAPPING FOR CURRENT_USER SERVER {} "
                                  "OPTIONS (user {}, password {})").format(
                 sql.Identifier(server), sql.Literal(opts["reader_user"]), sql.Literal(opts["reader_password"])))
+        else:
+            # Pick up a rotated password, or a changed endpoint, without a manual drop.
+            conn.execute(sql.SQL("ALTER SERVER {} OPTIONS (SET host {}, SET port {}, SET dbname {}, "
+                                 "SET sslmode {})").format(
+                sql.Identifier(server), sql.Literal(opts["host"]), sql.Literal(str(opts["port"])),
+                sql.Literal(opts["dbname"]), sql.Literal(opts["sslmode"])))
+            conn.execute(sql.SQL("ALTER USER MAPPING FOR CURRENT_USER SERVER {} "
+                                 "OPTIONS (SET user {}, SET password {})").format(
+                sql.Identifier(server), sql.Literal(opts["reader_user"]), sql.Literal(opts["reader_password"])))
         for table, columns in tables.items():
-            exists = conn.execute(
-                "SELECT 1 FROM pg_foreign_table ft JOIN pg_class c ON c.oid = ft.ftrelid "
-                "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s",
-                (schema, table)).fetchone()
-            if not exists:
-                conn.execute(sql.SQL("CREATE FOREIGN TABLE {}.{} ({}) SERVER {} "
-                                     "OPTIONS (schema_name 'public', table_name {})").format(
-                    sql.Identifier(schema), sql.Identifier(table), sql.SQL(columns),
-                    sql.Identifier(server), sql.Literal(table)))
+            conn.execute(sql.SQL("DROP FOREIGN TABLE IF EXISTS {}.{}").format(
+                sql.Identifier(schema), sql.Identifier(table)))
+            conn.execute(sql.SQL("CREATE FOREIGN TABLE {}.{} ({}) SERVER {} "
+                                 "OPTIONS (schema_name 'public', table_name {})").format(
+                sql.Identifier(schema), sql.Identifier(table), sql.SQL(columns),
+                sql.Identifier(server), sql.Literal(table)))
 
 
 def migrate_org(org_id: str, inject_bug: bool = False) -> dict:
     """inject_bug=True ignores wildcard denies, to show the diff harness catching it."""
+    placement.require_migratable(org_id, "migrate configuration and permissions")
     deny_filter = "AND p.resource <> '*'" if inject_bug else ""
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as conn:
         _ensure_fdw(conn)
@@ -98,7 +118,8 @@ def migrate_org(org_id: str, inject_bug: bool = False) -> dict:
             INSERT INTO connectors (id, org_id, connector_type, settings, secret_ref)
             SELECT id, org_id, connector_type, settings, 'tenantmig/' || org_id || '/connector/' || id
             FROM v1_messaging.connector_configs WHERE org_id = %s
-            ON CONFLICT (id) DO UPDATE SET connector_type = EXCLUDED.connector_type,
+            ON CONFLICT (id) DO UPDATE SET org_id = EXCLUDED.org_id,
+                                           connector_type = EXCLUDED.connector_type,
                                            settings = EXCLUDED.settings""", (org_id,)).rowcount
         connectors_removed = conn.execute("""
             DELETE FROM connectors c WHERE c.org_id = %s AND NOT EXISTS
@@ -110,7 +131,8 @@ def migrate_org(org_id: str, inject_bug: bool = False) -> dict:
                      (org_id,))
         principals = conn.execute("""
             INSERT INTO principals SELECT id, org_id, email FROM v1_auth.users WHERE org_id = %s
-            ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email""", (org_id,)).rowcount
+            ON CONFLICT (id) DO UPDATE SET org_id = EXCLUDED.org_id,
+                                           email = EXCLUDED.email""", (org_id,)).rowcount
         principals_removed = conn.execute("""
             DELETE FROM principals p WHERE p.org_id = %s AND NOT EXISTS
               (SELECT 1 FROM v1_auth.users u WHERE u.org_id = %s AND u.id = p.id)""",
@@ -119,6 +141,14 @@ def migrate_org(org_id: str, inject_bug: bool = False) -> dict:
             INSERT INTO id_map (entity, old_id, new_id)
             SELECT 'principal', id::text, id::text FROM v1_auth.users WHERE org_id = %s
             ON CONFLICT DO NOTHING""", (org_id,))
+        # Prune dangling entries: the principal is gone from both V1 (for this tenant) and V2.
+        # Other tenants' entries still match a row in `principals`, so they are left alone.
+        id_map_pruned = conn.execute("""
+            DELETE FROM id_map m WHERE m.entity = 'principal'
+              AND NOT EXISTS (SELECT 1 FROM v1_auth.users u WHERE u.id::text = m.old_id AND u.org_id = %s)
+              AND NOT EXISTS (SELECT 1 FROM principals p WHERE p.id::text = m.new_id)""",
+                                     (org_id,)).rowcount
         grants = conn.execute(GRANTS_SQL.format(deny_filter=deny_filter), {"org": org_id}).rowcount
     return {"org_id": org_id, "connectors": connectors, "connectors_removed": connectors_removed,
-            "principals": principals, "principals_removed": principals_removed, "grants": grants}
+            "principals": principals, "principals_removed": principals_removed,
+            "id_map_pruned": id_map_pruned, "grants": grants}

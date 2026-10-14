@@ -9,28 +9,16 @@ as in the sharding reference architecture, works equally well.)
                       └──verification failed──▶ v1   (V1 was authoritative throughout)
 """
 import time
+from datetime import datetime, timezone
 
 import psycopg
 
-from tenantmig import content_job, config_job, object_job, perm_diff, reconcile, settings
+from tenantmig import content_job, config_job, object_job, perm_diff, placement, reconcile, settings
 from tenantmig.store import ContentStore
 
-
-PLACEMENT_DDL = (__import__("pathlib").Path(__file__).resolve().parent / "placement.sql").read_text()
-
-
-def _ensure(conn) -> None:
-    conn.execute(PLACEMENT_DDL)
-
-
-def _set(conn, org_id: str, status: str, cell: str | None, note: str) -> None:
-    conn.execute("""
-        INSERT INTO tenant_placement (org_id, status, cell) VALUES (%s, %s, %s)
-        ON CONFLICT (org_id) DO UPDATE SET status = EXCLUDED.status, cell = EXCLUDED.cell, updated_at = now()""",
-                 (org_id, status, cell))
-    conn.execute("INSERT INTO tenant_placement_log (org_id, status, cell, note) VALUES (%s, %s, %s, %s)",
-                 (org_id, status, cell, note))
-    conn.commit()
+PLACEMENT_DDL = placement.DDL
+_ensure = placement.ensure
+_set = placement.set_status
 
 
 def where(org_id: str) -> dict:
@@ -42,8 +30,38 @@ def where(org_id: str) -> dict:
                         (org_id,)).fetchall()
     status, cell, updated = row if row else ("v1", None, None)
     route = {"v1": "V1 platform", "frozen": "V1 platform, writes paused", "v2": f"cell {cell}"}[status]
-    return {"org_id": org_id, "status": status, "cell": cell, "routes_to": route, "updated_at": updated,
-            "history": [dict(status=s, cell=cl, note=n, at=t) for s, cl, n, t in log]}
+    out = {"org_id": org_id, "status": status, "cell": cell, "routes_to": route, "updated_at": updated}
+    if status == "frozen" and updated is not None:
+        # Alarm on this in production: a tenant stuck frozen has its writes paused.
+        out["frozen_for_seconds"] = int((datetime.now(timezone.utc) - updated).total_seconds())
+    out["history"] = [dict(status=s, cell=cl, note=n, at=t) for s, cl, n, t in log]
+    return out
+
+
+def _missing_secrets(org_id: str) -> list[str]:
+    """Check that every connector's secret_ref actually resolves in Secrets Manager.
+
+    `forget` deletes the V1 `credentials` column for good, so a connector whose secret was
+    never created would be unrecoverable. Skipped locally (no Secrets Manager) and when
+    CHECK_CONNECTOR_SECRETS is off.
+    """
+    if not settings.CHECK_CONNECTOR_SECRETS:
+        return []
+    import boto3
+    from botocore.exceptions import ClientError
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as conn:
+        refs = [r[0] for r in conn.execute("SELECT secret_ref FROM connectors WHERE org_id = %s", (org_id,))]
+    sm = boto3.client("secretsmanager", region_name=settings.S3_REGION)
+    missing = []
+    for ref in refs:
+        try:
+            sm.describe_secret(SecretId=ref)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("ResourceNotFoundException", "AccessDeniedException"):
+                missing.append(ref)
+            else:
+                raise
+    return missing
 
 
 def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = None) -> dict:
@@ -51,13 +69,20 @@ def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = No
 
     - Only a tenant on `v1` (or `frozen`, left by a crashed run) can be cut over, and only one
       cutover per tenant runs at a time (advisory lock).
-    - After freezing, waits `drain_seconds` (default PLACEMENT_CACHE_TTL_SECONDS): routers that
-      cache tenant_placement may accept V1 writes until their cache refreshes, and those writes
-      must land before the final pass. Set it to your router's cache TTL plus a margin, or to 0
-      if writes are blocked on the V1 side (for example by revoking the tenant's write role).
-    - The V1 copy stays authoritative until the last step. If verification fails, or any step
-      raises, the tenant goes back to `v1`. Nothing has to be undone in V1.
+    - After freezing, waits `drain_seconds` (default PLACEMENT_CACHE_TTL_SECONDS). A router
+      that caches tenant_placement can keep sending writes to V1 until its cache refreshes.
+      **Waiting bounds the routing decision, not the commit**: a request that was already in
+      flight, or that is retried, can still commit after the wait, and any writer that never
+      reads tenant_placement (connector ingestion, queue consumers, batch jobs) is not stopped
+      by this at all. For those, block the tenant's writes in V1 itself and pass
+      `--drain-seconds 0`. See GUIDE.md section 5.6.
+    - The V1 copy stays authoritative until the last step. If verification fails, or the
+      process is interrupted, the tenant goes back to `v1`. Nothing has to be undone in V1.
+      A hard kill (SIGKILL, or the host dying) can still leave it `frozen`: re-running
+      `cutover` from `frozen` is safe, and `where` reports how long it has been frozen.
     """
+    # `cell` is the label recorded in tenant_placement, which is what the router reads. The
+    # rows always go to the database at V2_CELL_MESSAGING_DSN: point that at the cell you mean.
     cell = cell or settings.CELL_ID
     drain = settings.PLACEMENT_CACHE_TTL_SECONDS if drain_seconds is None else drain_seconds
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
@@ -82,13 +107,21 @@ def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = No
                 objects = object_job.migrate_objects(org_id)
                 r = reconcile.reconcile_org(org_id)
             d = perm_diff.diff_org(org_id)
-        except Exception as e:                                     # any failure: back to V1
+            missing_secrets = _missing_secrets(org_id)
+        except BaseException as e:
+            # BaseException, not Exception: SystemExit and KeyboardInterrupt (and the
+            # SystemExit the CLI raises on SIGTERM) must unfreeze the tenant too, or it is
+            # left with writes paused. Programming errors are re-raised after the rollback.
             _set(mgmt, org_id, "v1", None, f"rolled back: {type(e).__name__}: {e}"[:500])
+            if not isinstance(e, Exception):
+                raise
             return {"org_id": org_id, "cut_over": False, "status": "v1",
                     "reasons": [f"{type(e).__name__}: {e}"]}
 
         problems = (["reconciliation failed"] if not r["passed"] else []) + \
-                   ([f"{len(d['disagreements'])} permission disagreements"] if d["disagreements"] else [])
+                   ([f"{len(d['disagreements'])} permission disagreements"] if d["disagreements"] else []) + \
+                   ([f"{len(missing_secrets)} connector secrets missing: {missing_secrets[:3]}"]
+                    if missing_secrets else [])
         if problems:
             _set(mgmt, org_id, "v1", None, "rolled back: " + ", ".join(problems))
             return {"org_id": org_id, "cut_over": False, "status": "v1", "reasons": problems,
@@ -96,6 +129,7 @@ def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = No
 
         _set(mgmt, org_id, "v2", cell, f"verified and redirected to {cell}")
     return {"org_id": org_id, "cut_over": True, "status": "v2", "cell": cell, "drained_seconds": drain,
+            "connector_secrets_checked": settings.CHECK_CONNECTOR_SECRETS,
             "final_delta_rows": final.rows, "backfilled_rows": final.backfilled, "grants": config["grants"],
             "objects_recopied": bool(objects), "reconciled_rows": r["v2_rows"]}
 

@@ -74,6 +74,9 @@ export class SandboxStack extends Stack {
         backup: { retention: Duration.days(1) },
         deletionProtection: false,              // sandbox only, synthetic data
         removalPolicy: RemovalPolicy.DESTROY,
+        // Only applies to logs this cluster actually exports. No exports are enabled here
+        // (they would carry statement text, including any failing ALTER ROLE), so this is a
+        // default for the day someone turns cloudwatchLogsExports on.
         cloudwatchLogsRetention: logs.RetentionDays.ONE_WEEK,
       });
       (c.node.defaultChild as rds.CfnDBCluster).addPropertyOverride(
@@ -106,9 +109,21 @@ export class SandboxStack extends Stack {
 
     const bucketPrefix = `tm-${this.account}-`;
     taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['s3:CreateBucket', 's3:DeleteBucket', 's3:PutEncryptionConfiguration', 's3:PutBucketPublicAccessBlock',
-        's3:ListBucket', 's3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+      // Bucket lifecycle. No aws:ResourceAccount here: the bucket does not exist yet when
+      // CreateBucket is evaluated, so the key would be absent and the condition would deny.
+      // Creating or deleting a bucket owned by another account is impossible anyway.
+      actions: ['s3:CreateBucket', 's3:DeleteBucket', 's3:PutEncryptionConfiguration',
+        's3:PutBucketPublicAccessBlock'],
+      resources: [`arn:aws:s3:::${bucketPrefix}*`],
+    }));
+    taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      // Reading and writing objects, pinned to this account. Bucket names are globally unique
+      // and this prefix is guessable, so without this an attacker could pre-create one of our
+      // names in their own account and receive a tenant's content. The job also sends
+      // ExpectedBucketOwner on every call, which fails closed even if the policy is loosened.
+      actions: ['s3:ListBucket', 's3:GetObject', 's3:PutObject', 's3:DeleteObject'],
       resources: [`arn:aws:s3:::${bucketPrefix}*`, `arn:aws:s3:::${bucketPrefix}*/*`],
+      conditions: { StringEquals: { 'aws:ResourceAccount': this.account } },
     }));
     taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['s3:ListAllMyBuckets'], resources: ['*'] }));
     cellKey.grantEncryptDecrypt(taskDef.taskRole);
@@ -116,19 +131,29 @@ export class SandboxStack extends Stack {
     // Step 8: S3 Batch Operations copies an org's objects out of the V1 shared bucket.
     const sharedBucket = `${bucketPrefix}v1-shared`;
     const batchRole = new iam.Role(this, 'BatchOpsRole', {
-      assumedBy: new iam.ServicePrincipal('batchoperations.s3.amazonaws.com'),
+      // Confused-deputy guard: only Batch Operations jobs created in this account can assume it.
+      assumedBy: new iam.ServicePrincipal('batchoperations.s3.amazonaws.com', {
+        conditions: {
+          StringEquals: { 'aws:SourceAccount': this.account },
+          ArnLike: { 'aws:SourceArn': `arn:aws:s3:${this.region}:${this.account}:job/*` },
+        },
+      }),
       description: 'S3 Batch Operations: copy V1 shared-bucket objects into per-org buckets',
     });
     batchRole.addToPolicy(new iam.PolicyStatement({
       actions: ['s3:GetObject', 's3:GetObjectVersion', 's3:GetObjectTagging', 's3:PutObject', 's3:PutObjectTagging'],
       resources: [`arn:aws:s3:::${bucketPrefix}*/*`],
+      conditions: { StringEquals: { 'aws:ResourceAccount': this.account } },
     }));
     batchRole.addToPolicy(new iam.PolicyStatement({
       actions: ['s3:ListBucket', 's3:GetBucketLocation'], resources: [`arn:aws:s3:::${bucketPrefix}*`],
+      conditions: { StringEquals: { 'aws:ResourceAccount': this.account } },
     }));
     cellKey.grantEncryptDecrypt(batchRole);
     taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['s3:CreateJob', 's3:DescribeJob'], resources: ['*'],
+      // s3:CreateJob has no job resource to scope to before the job exists. UpdateJobStatus
+      // is needed so a timed-out job is cancelled rather than left running.
+      actions: ['s3:CreateJob', 's3:DescribeJob', 's3:UpdateJobStatus'], resources: ['*'],
     }));
     taskDef.taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       // Scoped to the one Batch Operations role. (s3:CreateJob does not set iam:PassedToService.)
@@ -146,6 +171,17 @@ export class SandboxStack extends Stack {
     const environment: Record<string, string> = {
       AWS_REGION: this.region, ORG_BUCKET_PREFIX: bucketPrefix, CELL_KMS_KEY_ARN: cellKey.keyArn,
       TENANTMIG_SANDBOX: '1', PLACEMENT_CACHE_TTL_SECONDS: '5', MIGRATION_BUCKET: `${bucketPrefix}migration`,
+      // Paired with the aws:ResourceAccount conditions above.
+      EXPECTED_BUCKET_OWNER: this.account,
+      // The fdw hop stays on sslmode=require: encrypted, but the server certificate is not
+      // verified. Verification needs a CA the *client* trusts, and here the fdw client is the
+      // managed Aurora management instance, not this container. Tested on Aurora PostgreSQL 18:
+      // verify-full fails with CERTIFICATE_VERIFY_FAILED both with a file path (no readable
+      // path on a managed host) and with sslrootcert=system (the Amazon RDS CA is not a public
+      // root). The hop is confined to isolated subnets and a security group that only allows
+      // the two V1 clusters. The job's own connections can and should use verify-full: see
+      // GUIDE.md section 9.
+      FDW_V1_MESSAGING_SSLMODE: 'require', FDW_V1_AUTH_SSLMODE: 'require',
       CODE_BUCKET: code.s3BucketName, CODE_KEY: code.s3ObjectKey,
       SQL_DIR: '/app/sql', V1_SHARED_BUCKET: sharedBucket, BATCH_OPS_ROLE_ARN: batchRole.roleArn, ACCOUNT_ID: this.account,
     };

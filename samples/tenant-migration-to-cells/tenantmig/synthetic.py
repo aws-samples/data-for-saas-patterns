@@ -12,11 +12,11 @@ import psycopg
 from tenantmig import settings
 
 CHANNELS = ["email", "chat", "voice", "video", "sms", "social"]
-RESOURCES = ["mailbox", "review_queue", "policy", "export", "audit_log", "connector"]
+RESOURCES = ["record", "collection", "policy", "export", "activity_log", "connector"]
 ACTIONS = ["read", "write", "approve", "export"]
 BOILERPLATE = [
-    "has joined the chat", "has left the chat", "Out of office until Monday.",
-    "Please see attached.", "Thanks!", "This message has been archived for compliance.",
+    "has joined the channel", "has left the channel", "Out of office until Monday.",
+    "Please see attached.", "Thanks!", "Automated notification: no action required.",
 ]
 
 
@@ -50,6 +50,9 @@ def _shared_bucket_objects(org_ids: list[str], per_org: int, rng: random.Random)
 
 
 def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, objects_per_org: int = 200) -> list[str]:
+    """Replace V1 with synthetic tenants. TRUNCATES the V1 tables, so it is sandbox-only."""
+    from tenantmig.cli import _require_sandbox
+    _require_sandbox("truncate V1 and generate synthetic data")
     rng = random.Random(seed)
     org_ids = [str(uuid.UUID(int=rng.getrandbits(128))) for _ in range(orgs)]
     now = datetime.now(timezone.utc)
@@ -92,14 +95,14 @@ def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, object
                 auth.execute("INSERT INTO roles VALUES (%s, %s, %s)", (role_id, org, name))
             perms = [
                 (roles["admin"], "*", "*", "allow"),
-                (roles["reviewer"], "review_queue", "*", "allow"),
-                (roles["reviewer"], "mailbox", "read", "allow"),
+                (roles["reviewer"], "collection", "*", "allow"),
+                (roles["reviewer"], "record", "read", "allow"),
                 (roles["reviewer"], "policy", "read", "allow"),
                 (roles["exporter"], "*", "read", "allow"),
                 (roles["exporter"], "export", "export", "allow"),
                 (roles["exporter"], "*", "write", "deny"),
                 (roles["readonly"], "*", "read", "allow"),
-                (roles["readonly"], "audit_log", "read", "deny"),
+                (roles["readonly"], "activity_log", "read", "deny"),
             ]
             auth.cursor().executemany("INSERT INTO role_permissions VALUES (%s, %s, %s, %s)", perms)
 

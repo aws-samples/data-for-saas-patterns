@@ -215,3 +215,219 @@ def test_reset_refuses_outside_a_sandbox(monkeypatch):
         cli.reset()
     with pytest.raises(SystemExit):
         cli.purge_buckets()
+
+
+# --- regressions from the independent review (14 Oct) ---
+
+def test_migrate_steps_refuse_on_a_live_tenant(org):
+    """B2: a migration step must not overwrite (or empty) a tenant that is live in its cell."""
+    from tenantmig import config_job, content_job, cutover, object_job
+    _migrate_all(org)
+    assert cutover.cutover(org, drain_seconds=0)["cut_over"]
+    cutover.forget(org, confirm=True)                      # V1 copy is gone
+    for call in (lambda: config_job.migrate_org(org),
+                 lambda: content_job.migrate_org(org),
+                 lambda: object_job.migrate_objects(org)):
+        with pytest.raises(SystemExit):
+            call()
+    import psycopg
+    from tenantmig import settings
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+        assert m.execute("SELECT count(*) FROM principals WHERE org_id = %s", (org,)).fetchone()[0] == 25
+        assert m.execute("SELECT count(*) FROM grants g JOIN principals p ON p.id = g.principal_id "
+                         "WHERE p.org_id = %s", (org,)).fetchone()[0] > 0
+
+
+def test_generate_and_init_refuse_outside_a_sandbox(monkeypatch):
+    """B3: the most destructive command (TRUNCATE on V1) was unguarded."""
+    from tenantmig import cli, settings, synthetic
+    monkeypatch.setattr(settings, "SANDBOX", False)
+    with pytest.raises(SystemExit):
+        synthetic.generate(orgs=1, messages_per_org=1)
+    with pytest.raises(SystemExit):
+        cli.init_schemas()
+
+
+def test_margin_does_not_skip_a_lower_id_committed_late(org):
+    """S1: the watermark must not advance past a row still inside the safety margin."""
+    import psycopg
+    from tenantmig import content_job, settings
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        top = msg.execute("SELECT max(id) FROM messages").fetchone()[0]   # ids are global
+        # 101 is brand new (inside the margin); 102 is old (outside it) but has a higher id.
+        msg.execute("INSERT INTO messages VALUES (%s, %s, 'email', 'a@example.com', now(), now(), 'fresh')",
+                    (top + 1, org))
+        msg.execute("INSERT INTO messages VALUES (%s, %s, 'email', 'b@example.com', now(), "
+                    "now() - interval '1 hour', 'older')", (top + 2, org))
+    first = content_job.migrate_org(org)
+    assert first.held_back >= 1                            # the fresh row was held back
+    assert first.watermark < top + 1                       # and the watermark stopped below it
+    with psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as cell:
+        have = {r[0] for r in cell.execute("SELECT id FROM messages WHERE org_id = %s AND id > %s",
+                                           (org, top))}
+    assert have == set()                                   # neither row copied yet: correct
+    # Once the fresh row ages out of the margin, a plain delta pass picks up both.
+    import tenantmig.settings as st
+    old = st.DELTA_SAFETY_SECONDS
+    try:
+        st.DELTA_SAFETY_SECONDS = 0
+        content_job.migrate_org(org)
+    finally:
+        st.DELTA_SAFETY_SECONDS = old
+    with psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as cell:
+        have = {r[0] for r in cell.execute("SELECT id FROM messages WHERE org_id = %s AND id > %s",
+                                           (org, top))}
+    assert have == {top + 1, top + 2}
+
+
+def test_repair_fixes_deleted_and_edited_rows(org):
+    """S4: repair has to converge, not only backfill."""
+    import psycopg
+    from tenantmig import content_job, object_job, reconcile, settings
+    _migrate_all(org)
+    assert reconcile.reconcile_org(org)["passed"]
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        gone = msg.execute("SELECT id FROM messages WHERE org_id = %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+        edited = msg.execute("SELECT id FROM messages WHERE org_id = %s ORDER BY id OFFSET 5 LIMIT 1",
+                             (org,)).fetchone()[0]
+        msg.execute("DELETE FROM messages WHERE id = %s", (gone,))
+        msg.execute("UPDATE messages SET sender = 'edited@example.com', content = 'edited body' WHERE id = %s",
+                    (edited,))
+    assert not reconcile.reconcile_org(org)["passed"]
+    r = content_job.migrate_org(org, repair=True)
+    assert r.deleted_extras == 1 and r.recopied == 1
+    object_job.migrate_objects(org)
+    assert reconcile.reconcile_org(org)["passed"]
+    with psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as cell:
+        assert cell.execute("SELECT count(*) FROM messages WHERE id = %s", (gone,)).fetchone()[0] == 0
+        assert cell.execute("SELECT sender FROM messages WHERE id = %s", (edited,)).fetchone()[0] \
+            == "edited@example.com"
+
+
+def test_409_is_retried_not_treated_as_present(org):
+    """S11: a 409 means the object may be absent, so the PUT must be retried."""
+    from botocore.exceptions import ClientError
+    from tenantmig.store import ContentStore
+
+    class Conflicting(ContentStore):
+        calls = 0
+
+        def __init__(self):
+            super().__init__()
+
+        def _put(self, **kw):
+            Conflicting.calls += 1
+            if Conflicting.calls == 1:
+                raise ClientError({"Error": {"Code": "ConditionalRequestConflict"},
+                                   "ResponseMetadata": {"HTTPStatusCode": 409}}, "PutObject")
+            return {}
+
+    store = Conflicting()
+    store.s3.put_object = store._put
+    assert store.put_if_absent("any-bucket", "k", b"body") is True   # retried, then written
+    assert Conflicting.calls == 2
+
+    class Exists(ContentStore):
+        def __init__(self):
+            super().__init__()
+
+        def _put(self, **kw):
+            raise ClientError({"Error": {"Code": "PreconditionFailed"},
+                               "ResponseMetadata": {"HTTPStatusCode": 412}}, "PutObject")
+
+    e = Exists()
+    e.s3.put_object = e._put
+    assert e.put_if_absent("any-bucket", "k", b"body") is False      # 412: already there
+
+
+def test_uncatalogued_v1_rule_is_reported(org):
+    """S12: a V1 rule naming something outside the catalogue was dropped silently."""
+    import psycopg
+    from tenantmig import config_job, perm_diff, settings
+    with psycopg.connect(settings.V1_AUTH_DSN) as auth:
+        role = auth.execute("SELECT id FROM roles WHERE org_id = %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+        auth.execute("INSERT INTO role_permissions VALUES (%s, 'legacy_reports', 'read', 'allow')", (role,))
+    config_job.migrate_org(org)
+    d = perm_diff.diff_org(org)
+    assert "resource: legacy_reports" in d["uncatalogued"]
+    assert any(x["resource"] == "legacy_reports" for x in d["disagreements"])
+
+
+def test_parallel_config_jobs_do_not_race_on_fdw_setup(org):
+    """S6: _ensure_fdw used to check-then-create without a lock."""
+    from concurrent.futures import ThreadPoolExecutor
+    import psycopg
+    from tenantmig import cli, config_job, settings, synthetic
+    cli.init_schemas()
+    cli.reset()
+    orgs = synthetic.generate(orgs=4, messages_per_org=20, objects_per_org=2)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:       # start from no fdw objects
+        m.execute("DROP SCHEMA IF EXISTS v1_messaging CASCADE")
+        m.execute("DROP SCHEMA IF EXISTS v1_auth CASCADE")
+        m.execute("DROP SERVER IF EXISTS v1_messaging_srv CASCADE")
+        m.execute("DROP SERVER IF EXISTS v1_auth_srv CASCADE")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda o: config_job.migrate_org(o), orgs))
+    assert all(r["grants"] > 0 for r in results)
+
+
+def test_rotated_reader_password_is_picked_up(org):
+    """S7: the user mapping was created once and never updated."""
+    import psycopg
+    from psycopg import sql
+    from tenantmig import config_job, settings
+    config_job.migrate_org(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+        before = m.execute("SELECT umoptions::text FROM pg_user_mappings "
+                           "WHERE srvname = 'v1_auth_srv'").fetchone()[0]
+    rotated = settings.READER_PASSWORD + "-rotated"
+    with psycopg.connect(settings.V1_AUTH_DSN) as a, psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        for c in (a, msg):
+            c.execute(sql.SQL("ALTER ROLE tenantmig_reader PASSWORD {}").format(sql.Literal(rotated)))
+    old = settings.READER_PASSWORD
+    try:
+        for mod in (settings, config_job.settings):
+            mod.READER_PASSWORD = rotated
+        config_job.FDW_V1_AUTH_BACKUP = None
+        settings.FDW_V1_AUTH["reader_password"] = rotated
+        settings.FDW_V1_MESSAGING["reader_password"] = rotated
+        config_job.migrate_org(org)
+        with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+            after = m.execute("SELECT umoptions::text FROM pg_user_mappings "
+                              "WHERE srvname = 'v1_auth_srv'").fetchone()[0]
+        assert after != before and rotated in after
+    finally:
+        settings.READER_PASSWORD = old
+        settings.FDW_V1_AUTH["reader_password"] = old
+        settings.FDW_V1_MESSAGING["reader_password"] = old
+        with psycopg.connect(settings.V1_AUTH_DSN) as a, psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+            for c in (a, msg):
+                c.execute(sql.SQL("ALTER ROLE tenantmig_reader PASSWORD {}").format(sql.Literal(old)))
+
+
+def test_upgrade_drops_a_foreign_table_that_exposed_credentials(org):
+    """S7: an install from an older version kept the wider column list."""
+    import psycopg
+    from tenantmig import config_job, settings
+    config_job.migrate_org(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:       # simulate the old definition
+        m.execute("DROP FOREIGN TABLE v1_messaging.connector_configs")
+        m.execute("CREATE FOREIGN TABLE v1_messaging.connector_configs "
+                  "(id bigint, org_id uuid, connector_type text, settings jsonb, credentials text) "
+                  "SERVER v1_messaging_srv OPTIONS (schema_name 'public', table_name 'connector_configs')")
+    config_job.migrate_org(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+        cols = {r[0] for r in m.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'v1_messaging' AND table_name = 'connector_configs'")}
+    assert "credentials" not in cols
+
+
+def test_objects_step_only_copies_what_is_missing(org):
+    """S9: the freeze re-check used to re-copy every object."""
+    from tenantmig import content_job, object_job
+    content_job.migrate_org(org)
+    first = object_job.migrate_objects(org)
+    assert first["copied"] == 20
+    second = object_job.migrate_objects(org)
+    assert second["copied"] == 0 and second["mode"] == "up to date"
