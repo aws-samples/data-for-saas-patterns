@@ -42,5 +42,9 @@ echo "  s3 (MinIO) on :9000"
 cat >"$ROOT/env" <<EOF
 export FDW_V1_MESSAGING_HOST=localhost FDW_V1_MESSAGING_PORT=5415
 export FDW_V1_AUTH_HOST=localhost FDW_V1_AUTH_PORT=5416
+export TENANTMIG_SANDBOX=1                      # allows reset / purge-buckets on the local stack
+export PLACEMENT_CACHE_TTL_SECONDS=2            # local demo: pretend the router caches placement for 2 s
 EOF
+# Read-only fdw role and catalogue tables (idempotent).
+if [ -x .venv/bin/tenantmig ]; then (source "$ROOT/env" && .venv/bin/tenantmig init >/dev/null) && echo "  schemas + migration reader role ready"; fi
 echo "Ready. Run: source .local/env && tenantmig demo"

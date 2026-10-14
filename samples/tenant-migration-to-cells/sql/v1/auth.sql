@@ -27,3 +27,9 @@ CREATE TABLE role_permissions (
     effect    text NOT NULL CHECK (effect IN ('allow', 'deny')),
     PRIMARY KEY (role_id, resource, action, effect)
 );
+
+-- Application catalogue: every resource type and action the product defines. Both the
+-- transform and the permissions harness expand wildcards against this, so a resource that
+-- no rule names explicitly is still covered.
+CREATE TABLE catalogue_resources (name text PRIMARY KEY);
+CREATE TABLE catalogue_actions   (name text PRIMARY KEY);

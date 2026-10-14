@@ -28,10 +28,19 @@ class PassResult:
     bytes_written: int = 0
     seconds: float = 0.0
     watermark: int = 0
+    backfilled: int = 0          # rows found missing by the anti-join (final or repair pass)
 
 
 def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = None,
-                store: ContentStore | None = None) -> PassResult:
+                store: ContentStore | None = None, final: bool = False, repair: bool = False) -> PassResult:
+    """One pass for one tenant.
+
+    Normal (bulk or delta) passes copy rows after the watermark that are older than
+    DELTA_SAFETY_SECONDS, so a row whose lower id commits late isn't skipped by a watermark
+    that already moved past it. `final` (used by cutover, with writes frozen) drops the margin
+    and then anti-joins V1 against the cell to copy anything still missing. `repair` runs only
+    the anti-join, as the fix when reconciliation reports missing rows.
+    """
     hasher = hasher or Sha256Hasher()
     store = store or ContentStore()
     bucket = org_bucket(org_id)
@@ -53,21 +62,26 @@ def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = No
         ).fetchone()[0]
         dst.commit()
 
-        with src.cursor(name="msgs") as cur:          # server-side cursor: constant memory
-            cur.itersize = batch_size
-            cur.execute(
-                "SELECT id, org_id, channel, sender, sent_at, created_at, content "
-                "FROM messages WHERE org_id = %s AND id > %s ORDER BY id",
-                (org_id, watermark),
-            )
-            batch = []
-            for row in cur:
-                batch.append(row)
-                if len(batch) >= batch_size:
+        margin = 0 if final else settings.DELTA_SAFETY_SECONDS
+        if not repair:
+            with src.cursor(name="msgs") as cur:          # server-side cursor: constant memory
+                cur.itersize = batch_size
+                cur.execute(
+                    "SELECT id, org_id, channel, sender, sent_at, created_at, content FROM messages "
+                    "WHERE org_id = %s AND id > %s AND created_at < now() - make_interval(secs => %s) ORDER BY id",
+                    (org_id, watermark, margin),
+                )
+                batch = []
+                for row in cur:
+                    batch.append(row)
+                    if len(batch) >= batch_size:
+                        watermark = _flush(org_id, batch, bucket, hasher, store, dst, result)
+                        batch = []
+                if batch:
                     watermark = _flush(org_id, batch, bucket, hasher, store, dst, result)
-                    batch = []
-            if batch:
-                watermark = _flush(org_id, batch, bucket, hasher, store, dst, result)
+
+        if final or repair:
+            watermark = max(watermark, _backfill_missing(org_id, src, dst, bucket, hasher, store, result, batch_size))
 
         dst.execute("UPDATE migration.org_state SET passes = passes + 1, updated_at = now() WHERE org_id = %s",
                     (org_id,))
@@ -106,8 +120,29 @@ def _flush(org_id, batch, bucket, hasher: Hasher, store: ContentStore, dst, resu
             copy.write_row(r)
     # Rows and watermark commit together, so a pass that crashes mid-way re-runs from the last
     # committed batch: no duplicate rows, and objects already written are skipped by the PUT.
-    dst.execute("UPDATE migration.org_state SET last_message_id = %s, updated_at = now() WHERE org_id = %s",
-                (batch[-1][0], org_id))
+    dst.execute("UPDATE migration.org_state SET last_message_id = GREATEST(last_message_id, %s), "
+                "updated_at = now() WHERE org_id = %s", (batch[-1][0], org_id))
     dst.commit()
     result.rows += len(rows)
     return batch[-1][0]
+
+
+def _backfill_missing(org_id, src, dst, bucket, hasher: Hasher, store: ContentStore, result: PassResult,
+                      batch_size: int, range_size: int = 100_000) -> int:
+    """Anti-join, one id range at a time: copy every V1 row for the tenant that the cell lacks."""
+    lo, hi = src.execute("SELECT coalesce(min(id), 0), coalesce(max(id), -1) FROM messages WHERE org_id = %s",
+                         (org_id,)).fetchone()
+    top = 0
+    for start in range(lo, hi + 1, range_size):
+        end = start + range_size
+        have = {r[0] for r in dst.execute("SELECT id FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+                                          (org_id, start, end))}
+        ids = [r[0] for r in src.execute("SELECT id FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+                                         (org_id, start, end)) if r[0] not in have]
+        for i in range(0, len(ids), batch_size):
+            chunk = ids[i:i + batch_size]
+            batch = src.execute("SELECT id, org_id, channel, sender, sent_at, created_at, content FROM messages "
+                                "WHERE id = ANY(%s) ORDER BY id", (chunk,)).fetchall()
+            top = max(top, _flush(org_id, batch, bucket, hasher, store, dst, result))
+            result.backfilled += len(batch)
+    return top

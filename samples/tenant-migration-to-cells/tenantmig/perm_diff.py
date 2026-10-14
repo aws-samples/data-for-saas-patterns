@@ -22,11 +22,13 @@ def diff_org(org_id: str) -> dict:
             SELECT ur.user_id, rp.resource, rp.action, rp.effect
             FROM user_roles ur JOIN roles r ON r.id = ur.role_id AND r.org_id = %s
             JOIN role_permissions rp ON rp.role_id = r.id""", (org_id,)).fetchall()
+        # The application catalogue, read directly: the same source the transform expands against,
+        # but the transform never derives it, so a resource no rule names is still checked.
+        resources = [r[0] for r in auth.execute("SELECT name FROM catalogue_resources ORDER BY name")]
+        actions = [r[0] for r in auth.execute("SELECT name FROM catalogue_actions ORDER BY name")]
     perms: dict[int, list] = {}
     for uid, res, act, eff in rows:
         perms.setdefault(uid, []).append((res, act, eff))
-    resources = sorted({r[1] for r in rows if r[1] != "*"})
-    actions = sorted({r[2] for r in rows if r[2] != "*"})
 
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
         granted = set(mgmt.execute("""
@@ -42,4 +44,8 @@ def diff_org(org_id: str) -> dict:
         if old != new:
             disagreements.append({"user_id": uid, "resource": res, "action": act,
                                   "v1": "allow" if old else "deny", "v2": "allow" if new else "deny"})
+    # Grants outside the catalogue are disagreements too: V1 can't have allowed them.
+    known = set(itertools.product(users, resources, actions))
+    for uid, res, act in sorted(granted - known):
+        disagreements.append({"user_id": uid, "resource": res, "action": act, "v1": "deny", "v2": "allow"})
     return {"org_id": org_id, "decisions_checked": checked, "disagreements": disagreements}

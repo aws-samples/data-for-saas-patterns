@@ -4,14 +4,14 @@ The diagram below shows how to move one tenant at a time from a pooled platform 
 
 Tenant migration is a core capability of sharded and cellular SaaS architectures (see [Scale your relational database for SaaS, Part 2](https://aws.amazon.com/blogs/database/scale-your-relational-database-for-saas-part-2-sharding-and-routing/) and the [SaaS storage strategies whitepaper](https://docs.aws.amazon.com/whitepapers/latest/multi-tenant-saas-storage-strategies/data-migration.html)). This architecture implements the **Clone → Flip → Redirect → Forget** sequence from [Reducing the scope of impact with cell-based architecture: Cell migration](https://docs.aws.amazon.com/wellarchitected/latest/reducing-scope-of-impact-with-cell-based-architecture/cell-migration.html).
 
-![arch diagram](./diagrams/tenant-migration-to-cells.png)
+![arch diagram](../samples/tenant-migration-to-cells/docs/tenant-migration-to-cells.png)
 
 ## Components
 
 1. **V1 platform**: Amazon Aurora PostgreSQL databases (messaging with inline content and platform configuration, plus auth), and a shared S3 bucket with objects under a tenant ID prefix.
 2. **Content job**: a container (Kubernetes Job on Amazon EKS with [EKS Pod Identity](https://docs.aws.amazon.com/eks/latest/userguide/pod-identities.html), or an Amazon ECS task on [AWS Fargate](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html)) that hashes each message's content, writes it to the tenant's S3 bucket only if the key is absent, and loads the row with `content_ref` into the cell.
-3. **Configuration transform**: SQL using [`postgres_fdw`](https://docs.aws.amazon.com/prescriptive-guidance/latest/aurora-postgresql-integration/remote-postgresql-databases.html) from the management database. It joins auth and platform configuration, expands wildcard permissions, subtracts denies, and replaces connector credentials with a reference to [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html).
-4. **Permissions diff harness**: evaluates the old and new authorization models independently on the same set of questions, and lists every disagreement.
+3. **Configuration transform**: SQL using [`postgres_fdw`](https://docs.aws.amazon.com/prescriptive-guidance/latest/aurora-postgresql-integration/remote-postgresql-databases.html) from the management database. It connects as a read-only role that can't see credentials, joins auth and platform configuration, expands wildcard permissions against the application catalogue, subtracts denies, converges changes and deletions, and replaces connector credentials with a reference to [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html).
+4. **Permissions diff harness**: evaluates the old and new authorization models independently, on every (user, resource, action) in the application catalogue, and lists every disagreement.
 5. **[S3 Batch Operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-examples-copy.html)**: one Copy job per tenant, with a manifest built from [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) filtered by the tenant prefix.
 6. **Reconciliation**: compares row counts and checksums, checks that every `content_ref` resolves to an object, round-trips a sample of content, and confirms every shared object was copied.
 7. **V2 cell**: a cell messaging database (Aurora PostgreSQL global cluster per cell), a management database, and per-tenant S3 buckets encrypted with a cell AWS KMS key.
@@ -23,7 +23,7 @@ Tenant migration is a core capability of sharded and cellular SaaS architectures
 3. **Clone (deltas):** re-run the same job from a per-tenant watermark until cutover. New V1 rows follow the same code path as the bulk pass. If rows can change or be deleted, capture changes with [AWS DMS](https://docs.aws.amazon.com/dms/latest/userguide/CHAP_Source.PostgreSQL.html) instead of a watermark. For tables whose schema doesn't change, [logical replication with row filters](https://aws.amazon.com/blogs/database/postgresql-logical-replication-how-to-replicate-only-the-data-that-you-need/) is an alternative.
 4. **Clone (configuration and permissions):** transform into the management database.
 5. **Verify:** run the permissions diff harness and the reconciliation. Any disagreement or failed check blocks cutover.
-6. **Flip and Redirect:** freeze writes for the tenant, run a final delta pass, re-verify, update the tenant-to-cell mapping (`tenant_placement`), and grant the cell's IAM and KMS access. If re-verification fails, set the tenant back to V1. V1 was authoritative throughout, so nothing has to be undone.
+6. **Flip and Redirect:** refuse unless the tenant is still on V1, freeze its writes, wait out the router's placement-cache TTL (or block writes on the V1 side), run a final delta pass that also anti-joins for late commits, re-verify, update the tenant-to-cell mapping (`tenant_placement`), and grant the cell's IAM and KMS access. If re-verification fails or any step raises an exception, set the tenant back to V1. V1 was authoritative throughout, so nothing has to be undone.
 7. **Forget:** remove the tenant from V1 after the retention window.
 
 ![Cutover lifecycle](../samples/tenant-migration-to-cells/docs/tenant-migration-cutover.png)

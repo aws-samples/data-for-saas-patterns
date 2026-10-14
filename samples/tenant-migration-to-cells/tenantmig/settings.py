@@ -25,6 +25,10 @@ V2_CELL_MESSAGING_DSN = _dsn("V2_CELL_MESSAGING", 5418, "messaging")
 V2_MANAGEMENT_DSN = _dsn("V2_MANAGEMENT", 5419, "management")
 
 
+READER_USER = "tenantmig_reader"
+READER_PASSWORD = os.getenv("TENANTMIG_READER_PASSWORD", "local-reader")
+
+
 def _fdw(prefix: str, local_port: int, dbname: str) -> dict:
     """How the V2 management DB reaches a V1 database for postgres_fdw."""
     return dict(
@@ -32,8 +36,9 @@ def _fdw(prefix: str, local_port: int, dbname: str) -> dict:
         port=os.getenv(f"FDW_{prefix}_PORT") or os.getenv(f"{prefix}_PORT",
                                                           "5432" if os.getenv(f"{prefix}_HOST") else str(local_port)),
         dbname=os.getenv(f"{prefix}_DBNAME", dbname),
-        user=os.getenv(f"{prefix}_USER", "postgres"),
-        password=os.getenv(f"{prefix}_PASSWORD", "local"),
+        # The fdw connects as the read-only migration role, never as the master user.
+        reader_user=READER_USER,
+        reader_password=READER_PASSWORD,
         sslmode=os.getenv(f"{prefix}_SSLMODE", "require" if os.getenv(f"{prefix}_HOST") else "disable"),
     )
 
@@ -53,6 +58,17 @@ S3_WORKERS = int(os.getenv("S3_WORKERS", "32"))
 V1_SHARED_BUCKET = os.getenv("V1_SHARED_BUCKET", "tm-local-v1-shared")
 BATCH_OPS_ROLE_ARN = os.getenv("BATCH_OPS_ROLE_ARN")
 ACCOUNT_ID = os.getenv("ACCOUNT_ID")
+# Migration artefacts (Batch Operations manifests and reports) go to their own bucket.
+MIGRATION_BUCKET = os.getenv("MIGRATION_BUCKET", "tm-local-migration")
+BATCH_TIMEOUT_SECONDS = int(os.getenv("BATCH_TIMEOUT_SECONDS", "3600"))
+# Delta passes only copy rows older than this, so a lower id committing late isn't skipped.
+# The final pass at cutover uses no margin and an anti-join (see content_job).
+DELTA_SAFETY_SECONDS = int(os.getenv("DELTA_SAFETY_SECONDS", "60"))
+# How long the router may serve a cached tenant_placement. Cutover waits this long after
+# freezing, so writes accepted before the cache refreshed land before the final pass.
+PLACEMENT_CACHE_TTL_SECONDS = int(os.getenv("PLACEMENT_CACHE_TTL_SECONDS", "30"))
+# reset and purge-buckets delete data; they only run where this is set (local stack, sandbox).
+SANDBOX = os.getenv("TENANTMIG_SANDBOX") == "1"
 # The cell this sample migrates tenants into.
 CELL_ID = os.getenv("CELL_ID", "cell-1")
 # In AWS, per-org buckets are encrypted with this cell KMS key.

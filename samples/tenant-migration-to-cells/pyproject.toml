@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Per-tenant migration from a pooled platform into a cell"
 requires-python = ">=3.11"
 dependencies = [
-    "psycopg[binary]>=3.2",
-    "boto3>=1.35",
+    "psycopg[binary]==3.3.6",
+    "boto3==1.43.112",
 ]
 
 [project.scripts]

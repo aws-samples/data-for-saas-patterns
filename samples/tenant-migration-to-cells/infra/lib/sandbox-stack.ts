@@ -8,6 +8,7 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as rds from 'aws-cdk-lib/aws-rds';
 import * as assets from 'aws-cdk-lib/aws-s3-assets';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 export interface SandboxStackProps extends StackProps {
@@ -134,12 +135,22 @@ export class SandboxStack extends Stack {
       actions: ['iam:PassRole'], resources: [batchRole.roleArn],
     }));
 
+    // Password for the read-only role postgres_fdw uses on the V1 databases (created by `tenantmig init`).
+    // The fdw never uses the V1 master credentials.
+    const readerSecret = new secretsmanager.Secret(this, 'MigrationReaderSecret', {
+      secretName: 'tenantmig/migration-reader',
+      generateSecretString: { passwordLength: 32, excludePunctuation: true },
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
     const environment: Record<string, string> = {
       AWS_REGION: this.region, ORG_BUCKET_PREFIX: bucketPrefix, CELL_KMS_KEY_ARN: cellKey.keyArn,
+      TENANTMIG_SANDBOX: '1', PLACEMENT_CACHE_TTL_SECONDS: '5', MIGRATION_BUCKET: `${bucketPrefix}migration`,
       CODE_BUCKET: code.s3BucketName, CODE_KEY: code.s3ObjectKey,
       SQL_DIR: '/app/sql', V1_SHARED_BUCKET: sharedBucket, BATCH_OPS_ROLE_ARN: batchRole.roleArn, ACCOUNT_ID: this.account,
     };
     const secrets: Record<string, ecs.Secret> = {};
+    secrets['TENANTMIG_READER_PASSWORD'] = ecs.Secret.fromSecretsManager(readerSecret);
     for (const [prefix, { c, db }] of Object.entries(dbs)) {
       environment[`${prefix}_HOST`] = c.clusterEndpoint.hostname;
       environment[`${prefix}_DBNAME`] = db;
@@ -149,7 +160,7 @@ export class SandboxStack extends Stack {
 
     const bootstrap = [
       'set -e',
-      'pip install --quiet --disable-pip-version-check --root-user-action=ignore boto3 >/dev/null',
+      'pip install --quiet --disable-pip-version-check --root-user-action=ignore boto3==1.43.112 >/dev/null',
       'python -c "import boto3,os; boto3.client(\'s3\').download_file(os.environ[\'CODE_BUCKET\'], os.environ[\'CODE_KEY\'], \'/tmp/code.zip\')"',
       'mkdir -p /app && cd /app && python -m zipfile -e /tmp/code.zip .',
       'pip install --quiet --disable-pip-version-check --root-user-action=ignore . >/dev/null',

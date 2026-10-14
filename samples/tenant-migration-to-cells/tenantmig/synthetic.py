@@ -37,6 +37,12 @@ def _shared_bucket_objects(org_ids: list[str], per_org: int, rng: random.Random)
     store = ContentStore()
     store.ensure_bucket(settings.V1_SHARED_BUCKET)
     for org in org_ids:
+        # Start each tenant's prefix empty, so earlier runs don't leave extra objects behind.
+        for page in store.s3.get_paginator("list_objects_v2").paginate(Bucket=settings.V1_SHARED_BUCKET,
+                                                                       Prefix=f"{org}/"):
+            old = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if old:
+                store.s3.delete_objects(Bucket=settings.V1_SHARED_BUCKET, Delete={"Objects": old})
         for i in range(per_org):
             kind = rng.choice(["attachments", "originals"])
             store.s3.put_object(Bucket=settings.V1_SHARED_BUCKET, Key=f"{org}/{kind}/{i:05d}.eml",
@@ -50,7 +56,11 @@ def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, object
 
     with psycopg.connect(settings.V1_MESSAGING_DSN) as msg, psycopg.connect(settings.V1_AUTH_DSN) as auth:
         msg.execute("TRUNCATE messages, connector_configs, organisations CASCADE")
-        auth.execute("TRUNCATE role_permissions, user_roles, roles, users CASCADE")
+        auth.execute("TRUNCATE role_permissions, user_roles, roles, users, catalogue_resources, "
+                     "catalogue_actions CASCADE")
+        # The product's catalogue: includes resources and actions no role names explicitly.
+        auth.cursor().executemany("INSERT INTO catalogue_resources VALUES (%s)", [(r,) for r in RESOURCES])
+        auth.cursor().executemany("INSERT INTO catalogue_actions VALUES (%s)", [(a,) for a in ACTIONS])
 
         msg_id = user_id = role_id = conn_id = 0
         for n, org in enumerate(org_ids):
@@ -102,10 +112,10 @@ def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, object
     return org_ids
 
 
-def add_new_messages(org_id: str, count: int = 50, seed: int = 99) -> None:
-    """Simulate V1 still receiving messages for an org mid-migration."""
+def add_new_messages(org_id: str, count: int = 50, seed: int = 99, age_seconds: int = 0) -> None:
+    """Simulate V1 still receiving messages for an org mid-migration (created age_seconds ago)."""
     rng = random.Random(seed)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
     with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
         start = msg.execute("SELECT coalesce(max(id), 0) FROM messages").fetchone()[0]
         with msg.cursor().copy(

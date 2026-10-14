@@ -44,7 +44,13 @@ def test_dsn_from_parts_escapes_password(monkeypatch):
     monkeypatch.setenv("V1_MESSAGING_HOST", "db.example.internal")
     monkeypatch.setenv("V1_MESSAGING_PASSWORD", "p@ss/w:rd")
     from tenantmig import settings
-    importlib.reload(settings)
-    assert settings.V1_MESSAGING_DSN.startswith("postgresql://postgres:p%40ss%2Fw%3Ard@db.example.internal:5432/")
-    assert settings.V1_MESSAGING_DSN.endswith("sslmode=require")
-    assert settings.FDW_V1_MESSAGING["port"] == "5432"
+    try:
+        importlib.reload(settings)
+        assert settings.V1_MESSAGING_DSN.startswith("postgresql://postgres:p%40ss%2Fw%3Ard@db.example.internal:5432/")
+        assert settings.V1_MESSAGING_DSN.endswith("sslmode=require")
+        assert settings.FDW_V1_MESSAGING["port"] == "5432"
+        assert settings.FDW_V1_MESSAGING["reader_user"] == "tenantmig_reader"    # never the master user
+        assert "password" not in settings.FDW_V1_MESSAGING
+    finally:
+        monkeypatch.undo()
+        importlib.reload(settings)                      # don't leak the patched settings into other tests

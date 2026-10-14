@@ -65,7 +65,9 @@ def _copy_batch_operations(store, org_id, dest, keys) -> dict:
     # A manually created Batch Operations manifest can't be SSE-KMS (only S3 Inventory reports can),
     # so the manifest (bucket/key pairs) is written with SSE-S3, overriding the bucket's KMS default.
     # Copied objects still use the cell key.
-    put = store.s3.put_object(Bucket=settings.V1_SHARED_BUCKET, Key=manifest_key, Body=buf.getvalue().encode(),
+    # Manifests and reports live in a separate migration bucket, not in the V1 shared bucket.
+    store.ensure_bucket(settings.MIGRATION_BUCKET)
+    put = store.s3.put_object(Bucket=settings.MIGRATION_BUCKET, Key=manifest_key, Body=buf.getvalue().encode(),
                               ServerSideEncryption="AES256")
 
     s3control = boto3.client("s3control", region_name=settings.S3_REGION)
@@ -83,19 +85,27 @@ def _copy_batch_operations(store, org_id, dest, keys) -> dict:
         }},
         Manifest={
             "Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": ["Bucket", "Key"]},
-            "Location": {"ObjectArn": f"arn:aws:s3:::{settings.V1_SHARED_BUCKET}/{manifest_key}",
+            "Location": {"ObjectArn": f"arn:aws:s3:::{settings.MIGRATION_BUCKET}/{manifest_key}",
                          "ETag": put["ETag"].strip('"')},
         },
-        Report={"Enabled": True, "Bucket": f"arn:aws:s3:::{settings.V1_SHARED_BUCKET}",
+        Report={"Enabled": True, "Bucket": f"arn:aws:s3:::{settings.MIGRATION_BUCKET}",
                 "Prefix": f"_reports/{org_id}", "Format": "Report_CSV_20180820", "ReportScope": "FailedTasksOnly"},
     )
     job_id = job["JobId"]
+    deadline = time.monotonic() + settings.BATCH_TIMEOUT_SECONDS
     while True:
         d = s3control.describe_job(AccountId=settings.ACCOUNT_ID, JobId=job_id)["Job"]
         if d["Status"] in ("Complete", "Failed", "Cancelled"):
             break
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Batch Operations job {job_id} still {d['Status']} after "
+                               f"{settings.BATCH_TIMEOUT_SECONDS}s")
         time.sleep(10)
     p = d.get("ProgressSummary", {})
-    return {"org_id": org_id, "mode": "S3 Batch Operations", "job_id": job_id, "status": d["Status"],
-            "source_objects": len(keys), "succeeded": p.get("NumberOfTasksSucceeded"),
-            "failed": p.get("NumberOfTasksFailed"), "failure_reasons": d.get("FailureReasons", [])}
+    result = {"org_id": org_id, "mode": "S3 Batch Operations", "job_id": job_id, "status": d["Status"],
+              "source_objects": len(keys), "succeeded": p.get("NumberOfTasksSucceeded"),
+              "failed": p.get("NumberOfTasksFailed"), "failure_reasons": d.get("FailureReasons", [])}
+    if d["Status"] != "Complete" or (p.get("NumberOfTasksFailed") or 0) > 0:
+        raise RuntimeError(f"Batch Operations copy failed for {org_id}: {result}. Failed tasks are listed under "
+                           f"s3://{settings.MIGRATION_BUCKET}/_reports/{org_id}/")
+    return result

@@ -8,6 +8,8 @@ as in the sharding reference architecture, works equally well.)
                       │
                       └──verification failed──▶ v1   (V1 was authoritative throughout)
 """
+import time
+
 import psycopg
 
 from tenantmig import content_job, config_job, object_job, perm_diff, reconcile, settings
@@ -44,37 +46,61 @@ def where(org_id: str) -> dict:
             "history": [dict(status=s, cell=cl, note=n, at=t) for s, cl, n, t in log]}
 
 
-def cutover(org_id: str, cell: str | None = None) -> dict:
-    """Flip and Redirect: freeze writes, final delta, verify, then route the tenant to its cell.
+def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = None) -> dict:
+    """Flip and Redirect: freeze writes, drain, final delta, verify, then route the tenant to its cell.
 
-    The V1 copy stays authoritative until the last step, so a failed verification is rolled
-    back by setting the tenant back to `v1`. Nothing has to be undone in V1.
+    - Only a tenant on `v1` (or `frozen`, left by a crashed run) can be cut over, and only one
+      cutover per tenant runs at a time (advisory lock).
+    - After freezing, waits `drain_seconds` (default PLACEMENT_CACHE_TTL_SECONDS): routers that
+      cache tenant_placement may accept V1 writes until their cache refreshes, and those writes
+      must land before the final pass. Set it to your router's cache TTL plus a margin, or to 0
+      if writes are blocked on the V1 side (for example by revoking the tenant's write role).
+    - The V1 copy stays authoritative until the last step. If verification fails, or any step
+      raises, the tenant goes back to `v1`. Nothing has to be undone in V1.
     """
     cell = cell or settings.CELL_ID
+    drain = settings.PLACEMENT_CACHE_TTL_SECONDS if drain_seconds is None else drain_seconds
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
         _ensure(mgmt)
-        _set(mgmt, org_id, "frozen", None, "write freeze: router stops V1 writes for this tenant")
+        if not mgmt.execute("SELECT pg_try_advisory_lock(hashtext('cutover:' || %s))", (org_id,)).fetchone()[0]:
+            raise SystemExit(f"Another cutover is already running for {org_id}.")
+        row = mgmt.execute("SELECT status FROM tenant_placement WHERE org_id = %s", (org_id,)).fetchone()
+        status = row[0] if row else "v1"
+        mgmt.commit()
+        if status not in ("v1", "frozen"):
+            raise SystemExit(f"Refusing to cut over {org_id}: it is already {status}. "
+                             "Re-running cutover on a live V2 tenant would route it back to V1.")
 
-        final = content_job.migrate_org(org_id)                 # catch everything written before the freeze
-        config = config_job.migrate_org(org_id)                 # idempotent re-run picks up late config changes
-        r = reconcile.reconcile_org(org_id)
-        objects = None
-        if not r["all_shared_objects_copied"]:
-            objects = object_job.migrate_objects(org_id)
+        _set(mgmt, org_id, "frozen", None, f"write freeze; draining {drain}s for router caches")
+        try:
+            time.sleep(drain)
+            final = content_job.migrate_org(org_id, final=True)    # no safety margin, plus anti-join
+            config = config_job.migrate_org(org_id)                # converges config and permissions on V1
             r = reconcile.reconcile_org(org_id)
-        d = perm_diff.diff_org(org_id)
+            objects = None
+            if not r["all_shared_objects_copied"]:
+                objects = object_job.migrate_objects(org_id)
+                r = reconcile.reconcile_org(org_id)
+            d = perm_diff.diff_org(org_id)
+        except Exception as e:                                     # any failure: back to V1
+            _set(mgmt, org_id, "v1", None, f"rolled back: {type(e).__name__}: {e}"[:500])
+            return {"org_id": org_id, "cut_over": False, "status": "v1",
+                    "reasons": [f"{type(e).__name__}: {e}"]}
 
         problems = (["reconciliation failed"] if not r["passed"] else []) + \
                    ([f"{len(d['disagreements'])} permission disagreements"] if d["disagreements"] else [])
         if problems:
             _set(mgmt, org_id, "v1", None, "rolled back: " + ", ".join(problems))
             return {"org_id": org_id, "cut_over": False, "status": "v1", "reasons": problems,
-                    "final_delta_rows": final.rows}
+                    "final_delta_rows": final.rows, "backfilled_rows": final.backfilled}
 
         _set(mgmt, org_id, "v2", cell, f"verified and redirected to {cell}")
-    return {"org_id": org_id, "cut_over": True, "status": "v2", "cell": cell,
-            "final_delta_rows": final.rows, "grants": config["grants"],
+    return {"org_id": org_id, "cut_over": True, "status": "v2", "cell": cell, "drained_seconds": drain,
+            "final_delta_rows": final.rows, "backfilled_rows": final.backfilled, "grants": config["grants"],
             "objects_recopied": bool(objects), "reconciled_rows": r["v2_rows"]}
+
+
+FORGET_CHUNK = 10_000
 
 
 def forget(org_id: str, confirm: bool = False, store: ContentStore | None = None) -> dict:
@@ -108,12 +134,18 @@ def forget(org_id: str, confirm: bool = False, store: ContentStore | None = None
         auth.execute("DELETE FROM role_permissions WHERE role_id IN (SELECT id FROM roles WHERE org_id = %s)", (org_id,))
         auth.execute("DELETE FROM roles WHERE org_id = %s", (org_id,))
         auth.execute("DELETE FROM users WHERE org_id = %s", (org_id,))
-        msg.execute("DELETE FROM messages WHERE org_id = %s", (org_id,))
+        auth.commit()
+        # Large tenants: delete messages in committed chunks rather than one huge transaction.
+        while msg.execute("DELETE FROM messages WHERE id IN (SELECT id FROM messages WHERE org_id = %s LIMIT %s)",
+                          (org_id, FORGET_CHUNK)).rowcount:
+            msg.commit()
         msg.execute("DELETE FROM connector_configs WHERE org_id = %s", (org_id,))
         msg.execute("DELETE FROM organisations WHERE id = %s", (org_id,))
     for i in range(0, len(keys), 1000):
-        store.s3.delete_objects(Bucket=settings.V1_SHARED_BUCKET,
-                                Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]})
+        resp = store.s3.delete_objects(Bucket=settings.V1_SHARED_BUCKET,
+                                       Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]})
+        if resp.get("Errors"):
+            raise RuntimeError(f"forget: {len(resp['Errors'])} objects not deleted (re-run forget): {resp['Errors'][:3]}")
 
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
         mgmt.execute("INSERT INTO tenant_placement_log (org_id, status, cell, note) "
