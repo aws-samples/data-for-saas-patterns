@@ -102,7 +102,7 @@ This sample provides tenant isolation patterns using [Attribute Based Access Con
 
 ## Tenant migration into a cell
 
-This sample moves one tenant at a time from a pooled platform into a cell on Amazon Aurora PostgreSQL and Amazon S3, and proves the move is correct before cutover. Message content moves out of PostgreSQL into a per-tenant S3 bucket by content hash, using S3 conditional writes for deduplication. Permissions move to a new model and are checked by a differential harness, existing objects are copied with S3 Batch Operations, and a reconciliation step blocks cutover unless counts, checksums and every content reference agree. A cutover command then freezes, re-verifies and redirects the tenant, rolling back automatically on failure. It runs locally or on AWS, with CDK.
+This sample moves one tenant at a time from a pooled platform into a cell on Amazon Aurora PostgreSQL and Amazon S3, where the target schema differs: message content moves out of PostgreSQL into a per-tenant S3 bucket keyed by content hash, and permissions move to a new model. A permissions diff harness and a reconciliation step block cutover unless both sides agree, and the cutover command freezes, re-verifies and redirects the tenant, rolling back automatically on failure. It runs locally or on AWS, with CDK.
 
 [Sample](./samples/tenant-migration-to-cells/) | [Guide](./samples/tenant-migration-to-cells/docs/GUIDE.md) | [Reference architecture](./reference-architectures/tenant-migration-to-cells.md)
 

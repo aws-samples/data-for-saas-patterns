@@ -180,7 +180,7 @@ export class SandboxStack extends Stack {
       // path on a managed host) and with sslrootcert=system (the Amazon RDS CA is not a public
       // root). The hop is confined to isolated subnets and a security group that only allows
       // the two V1 clusters. The job's own connections can and should use verify-full: see
-      // GUIDE.md section 9.
+      // GUIDE.md, security section.
       FDW_V1_MESSAGING_SSLMODE: 'require', FDW_V1_AUTH_SSLMODE: 'require',
       CODE_BUCKET: code.s3BucketName, CODE_KEY: code.s3ObjectKey,
       SQL_DIR: '/app/sql', V1_SHARED_BUCKET: sharedBucket, BATCH_OPS_ROLE_ARN: batchRole.roleArn, ACCOUNT_ID: this.account,

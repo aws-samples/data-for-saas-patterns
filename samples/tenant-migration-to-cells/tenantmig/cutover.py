@@ -75,7 +75,7 @@ def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = No
       flight, or that is retried, can still commit after the wait, and any writer that never
       reads tenant_placement (connector ingestion, queue consumers, batch jobs) is not stopped
       by this at all. For those, block the tenant's writes in V1 itself and pass
-      `--drain-seconds 0`. See GUIDE.md section 5.6.
+      `--drain-seconds 0`. See the GUIDE's cutover section.
     - The V1 copy stays authoritative until the last step. If verification fails, or the
       process is interrupted, the tenant goes back to `v1`. Nothing has to be undone in V1.
       A hard kill (SIGKILL, or the host dying) can still leave it `frozen`: re-running
