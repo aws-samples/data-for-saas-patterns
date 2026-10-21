@@ -1,0 +1,7 @@
+{
+  "compilerOptions": {
+    "target": "ES2022", "module": "commonjs", "lib": ["ES2022"], "strict": true,
+    "esModuleInterop": true, "skipLibCheck": true, "outDir": "build", "types": ["node"]
+  },
+  "include": ["bin", "lib"]
+}

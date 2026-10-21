@@ -1,0 +1,7 @@
+.local/
+.venv/
+__pycache__/
+*.egg-info/
+infra/node_modules/
+infra/cdk.out/
+infra/cdk.context.json
