@@ -19,6 +19,14 @@ def org():
     return synthetic.generate(orgs=2, messages_per_org=600, objects_per_org=20)[0]
 
 
+def _setup_fdw():
+    """The admin step that builds the migrator's fdw objects. Config runs only read them."""
+    import psycopg
+    from tenantmig import config_job, settings
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
+        config_job.setup_fdw(c)
+
+
 def _migrate_all(org_id):
     from tenantmig import config_job, content_job, object_job
     content_job.migrate_org(org_id)
@@ -191,20 +199,19 @@ def test_out_of_order_commit_is_repaired(org):
 
 
 def test_credentials_are_not_reachable_through_the_fdw(org):
-    """Review #7."""
+    """Review #7: the migrator's foreign tables and the tenant's own login both lack `credentials`."""
     import psycopg
-    from tenantmig import config_job, settings
+    from tenantmig import config_job, identities, settings
     config_job.migrate_org(org)
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
         cols = {r[0] for r in m.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = 'v1_messaging' AND table_name = 'connector_configs'")}
         assert cols and "credentials" not in cols
-    reader = settings.V1_MESSAGING_DSN.replace("postgres:local@", f"tenantmig_reader:{settings.READER_PASSWORD}@")
-    with psycopg.connect(reader) as r:
-        assert r.execute("SELECT count(id) FROM connector_configs WHERE org_id = %s", (org,)).fetchone()[0] == 3
+    with psycopg.connect(identities.tenant_dsn(settings.V1_MESSAGING_DSN, org)) as t:
+        assert t.execute("SELECT count(id) FROM connector_configs WHERE org_id = %s", (org,)).fetchone()[0] == 3
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            r.execute("SELECT credentials FROM connector_configs LIMIT 1")
+            t.execute("SELECT credentials FROM connector_configs LIMIT 1")
 
 
 def test_reset_refuses_outside_a_sandbox(monkeypatch):
@@ -354,10 +361,11 @@ def test_uncatalogued_v1_rule_is_reported(org):
 
 
 def test_parallel_config_jobs_do_not_race_on_fdw_setup(org):
-    """S6: _ensure_fdw used to check-then-create without a lock."""
+    """S6: the fdw setup used to check-then-create without a lock. Now it's an admin step, and
+    several runs of it at once must still converge."""
     from concurrent.futures import ThreadPoolExecutor
     import psycopg
-    from tenantmig import cli, config_job, settings, synthetic
+    from tenantmig import cli, config_job, identities, settings, synthetic
     cli.init_schemas()
     cli.reset()
     orgs = synthetic.generate(orgs=4, messages_per_org=20, objects_per_org=2)
@@ -366,56 +374,44 @@ def test_parallel_config_jobs_do_not_race_on_fdw_setup(org):
         m.execute("DROP SCHEMA IF EXISTS v1_auth CASCADE")
         m.execute("DROP SERVER IF EXISTS v1_messaging_srv CASCADE")
         m.execute("DROP SERVER IF EXISTS v1_auth_srv CASCADE")
+    def setup(_):
+        with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
+            config_job.setup_fdw(c)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda o: config_job.migrate_org(o), orgs))
+        list(pool.map(setup, range(4)))
+    for o in orgs:
+        identities.provision_tenant(o)          # the per-tenant mappings went with the servers
+    results = [config_job.migrate_org(o) for o in orgs]
     assert all(r["grants"] > 0 for r in results)
 
 
-def test_rotated_reader_password_is_picked_up(org):
-    """S7: the user mapping was created once and never updated."""
+def test_rotated_tenant_password_is_picked_up(org):
+    """S7: a rotated password reaches the tenant's login and the migrator's fdw mapping."""
     import psycopg
-    from psycopg import sql
-    from tenantmig import config_job, settings
-    config_job.migrate_org(org)
+    from tenantmig import config_job, identities, settings
+    bundle = identities._passwords(org, create=False)
+    identities._put_bundle(org, {**bundle, "tenant": "rotated-" + bundle["tenant"]})
+    identities.provision_tenant(org)
+    with psycopg.connect(identities.tenant_dsn(settings.V1_MESSAGING_DSN, org)) as t:
+        assert t.execute("SELECT 1").fetchone()[0] == 1
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
-        before = m.execute("SELECT umoptions::text FROM pg_user_mappings "
-                           "WHERE srvname = 'v1_auth_srv'").fetchone()[0]
-    rotated = settings.READER_PASSWORD + "-rotated"
-    with psycopg.connect(settings.V1_AUTH_DSN) as a, psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
-        for c in (a, msg):
-            c.execute(sql.SQL("ALTER ROLE tenantmig_reader PASSWORD {}").format(sql.Literal(rotated)))
-    old = settings.READER_PASSWORD
-    try:
-        for mod in (settings, config_job.settings):
-            mod.READER_PASSWORD = rotated
-        config_job.FDW_V1_AUTH_BACKUP = None
-        settings.FDW_V1_AUTH["reader_password"] = rotated
-        settings.FDW_V1_MESSAGING["reader_password"] = rotated
-        config_job.migrate_org(org)
-        with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
-            after = m.execute("SELECT umoptions::text FROM pg_user_mappings "
-                              "WHERE srvname = 'v1_auth_srv'").fetchone()[0]
-        assert after != before and rotated in after
-    finally:
-        settings.READER_PASSWORD = old
-        settings.FDW_V1_AUTH["reader_password"] = old
-        settings.FDW_V1_MESSAGING["reader_password"] = old
-        with psycopg.connect(settings.V1_AUTH_DSN) as a, psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
-            for c in (a, msg):
-                c.execute(sql.SQL("ALTER ROLE tenantmig_reader PASSWORD {}").format(sql.Literal(old)))
+        opts = m.execute("SELECT umoptions::text FROM pg_user_mappings WHERE srvname = 'v1_auth_srv' AND usename = %s",
+                         (identities.migrator_role(org),)).fetchone()[0]
+    assert "rotated-" in opts
+    assert config_job.migrate_org(org)["grants"] > 0
 
 
 def test_upgrade_drops_a_foreign_table_that_exposed_credentials(org):
     """S7: an install from an older version kept the wider column list."""
     import psycopg
     from tenantmig import config_job, settings
-    config_job.migrate_org(org)
+    _setup_fdw()
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:       # simulate the old definition
         m.execute("DROP FOREIGN TABLE v1_messaging.connector_configs")
         m.execute("CREATE FOREIGN TABLE v1_messaging.connector_configs "
                   "(id bigint, org_id uuid, connector_type text, settings jsonb, credentials text) "
                   "SERVER v1_messaging_srv OPTIONS (schema_name 'public', table_name 'connector_configs')")
-    config_job.migrate_org(org)
+    _setup_fdw()
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
         cols = {r[0] for r in m.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -431,3 +427,162 @@ def test_objects_step_only_copies_what_is_missing(org):
     assert first["copied"] == 20
     second = object_job.migrate_objects(org)
     assert second["copied"] == 0 and second["mode"] == "up to date"
+
+
+def test_content_only_edit_is_repaired(org):
+    """Review finding 1: a V1 content change with unchanged metadata must converge under --repair."""
+    import psycopg
+    from tenantmig import content_job, object_job, reconcile, settings
+    _migrate_all(org)
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        edited = msg.execute("SELECT id FROM messages WHERE org_id = %s ORDER BY id OFFSET 7 LIMIT 1",
+                             (org,)).fetchone()[0]
+        msg.execute("UPDATE messages SET content = 'content-only edit' WHERE id = %s", (edited,))
+    assert not reconcile.reconcile_org(org)["passed"]
+    r = content_job.migrate_org(org, repair=True)
+    assert r.recopied == 1
+    object_job.migrate_objects(org)
+    assert reconcile.reconcile_org(org)["passed"]
+
+
+def test_checksum_does_not_collide_on_delimiters(org):
+    """Review finding 8: a '|' that moves a field boundary must change the checksum."""
+    import psycopg
+    from tenantmig import reconcile, settings
+    _migrate_all(org)
+    assert reconcile.reconcile_org(org)["passed"]
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        row = msg.execute("SELECT id FROM messages WHERE org_id = %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+        msg.execute("UPDATE messages SET channel = 'a|b', sender = 'c' WHERE id = %s", (row,))
+    with psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as cell:
+        cell.execute("UPDATE messages SET channel = 'a', sender = 'b|c' WHERE id = %s", (row,))
+        cell.commit()
+    r = reconcile.reconcile_org(org)
+    assert not r["checksums_match"], "two different rows serialised to the same checksum input"
+
+
+def test_changed_source_object_is_recopied(org):
+    """Review finding 9: an overwritten V1 object keeps its key, so presence alone must not pass."""
+    from tenantmig import object_job, reconcile, settings
+    from tenantmig.store import ContentStore
+    _migrate_all(org)
+    store = ContentStore()
+    key = next(iter(store.list_objects(settings.V1_SHARED_BUCKET, prefix=f"{org}/")))
+    store.s3.put_object(Bucket=settings.V1_SHARED_BUCKET, Key=key, Body=b"changed in place")
+    assert not reconcile.reconcile_org(org)["all_shared_objects_copied"]
+    result = object_job.migrate_objects(org)
+    assert result["copied"] >= 1
+    assert reconcile.reconcile_org(org)["all_shared_objects_copied"]
+
+
+def test_a_step_cannot_run_while_a_cutover_holds_the_tenant(org):
+    """Review finding 2: the status check and the write must share the cutover lock."""
+    import psycopg
+    from tenantmig import content_job, settings
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as held:
+        assert held.execute("SELECT pg_try_advisory_lock(hashtext('cutover:' || %s))", (org,)).fetchone()[0]
+        with pytest.raises(SystemExit, match="already running"):
+            content_job.migrate_org(org)
+
+
+def test_cutover_refuses_while_a_step_holds_the_tenant(org):
+    import psycopg
+    from tenantmig import cutover, settings
+    _migrate_all(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as held:
+        held.execute("SELECT pg_try_advisory_lock(hashtext('cutover:' || %s))", (org,)).fetchone()
+        with pytest.raises(SystemExit, match="cutover or migration step"):
+            cutover.cutover(org, drain_seconds=0)
+    assert cutover.where(org)["status"] == "v1"
+
+
+def test_tenant_role_cannot_read_or_write_another_tenants_rows(org):
+    """Review finding 4: the database filters by tenant, whatever the job's own WHERE clauses say."""
+    import psycopg
+    from tenantmig import identities, settings
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        other = msg.execute("SELECT id FROM organisations WHERE id <> %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+        own = msg.execute("SELECT count(*) FROM messages WHERE org_id = %s", (org,)).fetchone()[0]
+    with psycopg.connect(identities.tenant_dsn(settings.V1_MESSAGING_DSN, org)) as msg:
+        assert msg.execute("SELECT count(*) FROM messages WHERE org_id = %s", (other,)).fetchone()[0] == 0
+        assert msg.execute("SELECT count(*) FROM messages").fetchone()[0] == own
+        with pytest.raises(psycopg.Error, match="row-level security"):
+            msg.execute("INSERT INTO messages (id, org_id, channel, sender, sent_at, created_at, content) "
+                        "VALUES (999999999, %s, 'x', 'x', now(), now(), 'x')", (other,))
+
+
+def test_group_role_with_no_tenant_sees_nothing(org):
+    """Fail closed: a role that isn't a tenant, such as the shared group role, sees no rows."""
+    import psycopg
+    from tenantmig import settings
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        msg.execute("SET ROLE tenantmig_tenant")
+        assert msg.execute("SELECT count(*) FROM messages").fetchone()[0] == 0
+        assert msg.execute("SELECT count(*) FROM organisations").fetchone()[0] == 0
+
+
+def test_migrator_and_control_roles_are_confined(org):
+    """The duty split: a tenant's migrator can't read V1 data or placement; its control login can't read config."""
+    import psycopg
+    from tenantmig import identities, settings
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org)) as c:
+            c.execute("SELECT count(*) FROM connectors")
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        with psycopg.connect(identities.migrator_dsn(settings.V2_MANAGEMENT_DSN, org)) as c:
+            c.execute("SELECT count(*) FROM tenant_placement")
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org)) as c:
+        assert c.execute("SELECT count(*) FROM tenant_placement").fetchone()[0] >= 0
+
+
+def test_each_tenants_logins_see_only_that_tenant(org):
+    """Per-tenant identities: a tenant's migrator and control logins see another tenant's rows as none."""
+    import psycopg
+    from tenantmig import identities, settings
+    _migrate_all(org)
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        other = msg.execute("SELECT id FROM organisations WHERE id <> %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+    identities.provision_tenant(other)
+    with psycopg.connect(identities.migrator_dsn(settings.V2_MANAGEMENT_DSN, org)) as m:
+        assert m.execute("SELECT count(*) FROM connectors WHERE org_id = %s", (other,)).fetchone()[0] == 0
+        assert m.execute("SELECT count(*) FROM principals WHERE org_id = %s", (other,)).fetchone()[0] == 0
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org)) as c:
+        assert c.execute("SELECT count(*) FROM tenant_placement WHERE org_id = %s", (other,)).fetchone()[0] == 0
+
+
+def test_connector_secret_refs_match_the_stored_secret_names(org):
+    """The migration records a secret_ref; the synthetic data stores the credential under the same name."""
+    import psycopg
+    from tenantmig import config_job, identities, settings
+    config_job.migrate_org(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+        refs = {r[0] for r in m.execute("SELECT secret_ref FROM connectors WHERE org_id = %s", (org,))}
+    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg:
+        ids = [r[0] for r in msg.execute("SELECT id FROM connector_configs WHERE org_id = %s", (org,))]
+    assert refs == {identities.connector_secret_name(org, i) for i in ids}
+
+
+def test_cutover_refuses_when_a_connector_secret_is_missing(org, monkeypatch):
+    """Review: a redirect with a missing connector secret means `forget` loses the credential for good."""
+    import boto3
+    import psycopg
+    from botocore.exceptions import ClientError
+    from tenantmig import cutover, identities, settings
+    _migrate_all(org)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as m:
+        ref = m.execute("SELECT secret_ref FROM connectors WHERE org_id = %s ORDER BY id LIMIT 1", (org,)).fetchone()[0]
+
+    class FakeSecrets:
+        def describe_secret(self, SecretId):
+            if SecretId == ref:
+                raise ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "DescribeSecret")
+            return {"Name": SecretId}
+
+    real_client = boto3.client
+    monkeypatch.setattr(settings, "CHECK_CONNECTOR_SECRETS", True)
+    monkeypatch.setattr(boto3, "client", lambda service, **k: FakeSecrets() if service == "secretsmanager"
+                        else real_client(service, **k))
+    result = cutover.cutover(org, drain_seconds=0)
+    assert not result["cut_over"]
+    assert any("connector secrets missing" in r for r in result["reasons"])
+    assert cutover.where(org)["status"] == "v1"

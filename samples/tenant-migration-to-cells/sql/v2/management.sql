@@ -33,10 +33,11 @@ CREATE TABLE grants (
 
 -- Old V1 ID -> new V2 ID, kept for audit and rollback.
 CREATE TABLE id_map (
+    org_id  uuid NOT NULL,
     entity  text NOT NULL,
     old_id  text NOT NULL,
     new_id  text NOT NULL,
-    PRIMARY KEY (entity, old_id)
+    PRIMARY KEY (org_id, entity, old_id)
 );
 
 -- Routing source of truth: which platform (and cell) serves each tenant.

@@ -8,15 +8,17 @@ equally well.)
                       │
                       └──failed or interrupted──▶ v1   (V1 was authoritative throughout)
 
-Every step that writes into V2 calls `require_migratable` first. Once a tenant is `v2` it is
-live in its cell, and a migration step would overwrite live data with stale V1 data (or, after
-`forget`, with nothing at all).
+Every step that writes into V2 is wrapped in `@guarded`. Once a tenant is `v2` it is live in its
+cell, and a migration step would overwrite live data with stale V1 data (or, after `forget`,
+with nothing at all).
 """
+import contextvars
+import functools
 import pathlib
 
 import psycopg
 
-from tenantmig import settings
+from tenantmig import identities, settings
 
 DDL = (pathlib.Path(__file__).resolve().parent / "placement.sql").read_text()
 
@@ -42,7 +44,6 @@ def ensure(conn) -> None:
 
 
 def get_status(conn, org_id: str) -> tuple[str, str | None]:
-    ensure(conn)
     row = conn.execute("SELECT status, cell FROM tenant_placement WHERE org_id = %s", (org_id,)).fetchone()
     return row if row else ("v1", None)
 
@@ -57,10 +58,12 @@ def set_status(conn, org_id: str, status: str, cell: str | None, note: str) -> N
     conn.commit()
 
 
-def require_migratable(org_id: str, what: str) -> str:
-    """Refuse to run a migration step against a tenant that is already live in its cell."""
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as conn:
-        status, cell = get_status(conn, org_id)
+# Set by cutover while it holds the tenant's lock, so the steps it calls don't try to take it again.
+HELD_BY_CUTOVER = contextvars.ContextVar("held_by_cutover", default=False)
+LOCK_SQL = "SELECT pg_try_advisory_lock(hashtext('cutover:' || %s))"
+
+
+def _check(status: str, cell: str | None, org_id: str, what: str) -> str:
     if status not in MIGRATABLE:
         raise SystemExit(
             f"Refusing to {what} for {org_id}: it is {status}"
@@ -68,3 +71,35 @@ def require_migratable(org_id: str, what: str) -> str:
             + ". The tenant is live in its cell, so this would overwrite live data with V1 data. "
               "Migrate it back to v1 deliberately if that is really what you want.")
     return status
+
+
+def require_migratable(org_id: str, what: str) -> str:
+    """Refuse to run a migration step against a tenant that is already live in its cell."""
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as conn:
+        status, cell = get_status(conn, org_id)
+    return _check(status, cell, org_id, what)
+
+
+def guarded(what: str):
+    """Run a write step only while the tenant is migratable, and hold its cutover lock for the whole step.
+
+    Checking the status once and then writing is a race: a cutover can start, freeze and redirect
+    the tenant in between. Taking the same advisory lock cutover holds closes that window, and
+    cutover itself is refused while a step is running. A step that starts after a crashed
+    cutover finds the tenant `frozen`, which is still migratable, and proceeds.
+    """
+    def wrap(fn):
+        @functools.wraps(fn)
+        def inner(org_id, *args, **kwargs):
+            if HELD_BY_CUTOVER.get():
+                require_migratable(org_id, what)
+                return fn(org_id, *args, **kwargs)
+            with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as conn:
+                if not conn.execute(LOCK_SQL, (org_id,)).fetchone()[0]:
+                    raise SystemExit(f"Refusing to {what} for {org_id}: a cutover or another step is already running for it.")
+                status, cell = get_status(conn, org_id)
+                conn.commit()                 # end the transaction; the session lock survives it
+                _check(status, cell, org_id, what)
+                return fn(org_id, *args, **kwargs)     # the lock is released when the connection closes
+        return inner
+    return wrap

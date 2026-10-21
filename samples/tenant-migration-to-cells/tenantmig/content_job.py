@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import psycopg
 
-from tenantmig import placement, settings
+from tenantmig import identities, placement, settings
 from tenantmig.hashing import Hasher, Sha256Hasher
 from tenantmig.store import ContentStore, org_bucket
 
@@ -37,6 +37,7 @@ class PassResult:
     held_back: int = 0           # rows inside the safety margin, left for the next pass
 
 
+@placement.guarded("run a content pass")
 def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = None,
                 store: ContentStore | None = None, final: bool = False, repair: bool = False) -> PassResult:
     """One pass for one tenant.
@@ -51,7 +52,6 @@ def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = No
     `repair` fixes what reconciliation reports: it backfills missing rows, re-copies rows that
     differ from V1, and deletes cell rows whose V1 row is gone.
     """
-    placement.require_migratable(org_id, "run a content pass")
     hasher = hasher or Sha256Hasher()
     store = store or ContentStore()
     bucket = org_bucket(org_id)
@@ -62,7 +62,8 @@ def migrate_org(org_id: str, batch_size: int = 1_000, hasher: Hasher | None = No
     # when the delta passes are pointed at a replica.
     src_dsn = settings.V1_MESSAGING_DSN if (final or repair) else settings.V1_MESSAGING_READ_DSN
 
-    with psycopg.connect(src_dsn) as src, psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as dst:
+    with psycopg.connect(identities.tenant_dsn(src_dsn, org_id)) as src, \
+            psycopg.connect(identities.tenant_dsn(settings.V2_CELL_MESSAGING_DSN, org_id)) as dst:
         org = src.execute("SELECT id, name, created_at FROM organisations WHERE id = %s", (org_id,)).fetchone()
         if org is None:
             raise ValueError(f"org {org_id} not found in V1")
@@ -140,11 +141,10 @@ def _flush(org_id, batch, bucket, hasher: Hasher, store: ContentStore, dst, resu
             else:
                 result.objects_deduped += 1
 
-    with dst.cursor().copy(
-        f"COPY messages ({COLUMNS}, content_ref) FROM STDIN"
-    ) as copy:
-        for r in rows:
-            copy.write_row(r)
+    # Batched INSERT, not COPY: PostgreSQL refuses COPY into a table with row-level security for
+    # a role that isn't exempt from it, and the app role isn't.
+    dst.cursor().executemany(f"INSERT INTO messages ({COLUMNS}, content_ref) "
+                             "VALUES (%s, %s, %s, %s, %s, %s, %s)", rows)
     # Rows and watermark commit together, so a pass that crashes mid-way re-runs from the last
     # committed batch: no duplicate rows, and objects already written are skipped by the PUT.
     dst.execute("UPDATE migration.org_state SET last_message_id = GREATEST(last_message_id, %s), "
@@ -174,11 +174,15 @@ def _repair(org_id, src, dst, bucket, hasher: Hasher, store: ContentStore, resul
     top = 0
     for start in range(lo, hi + 1, range_size):
         end = start + range_size
+        # A full repair compares content too, as its hash: a message whose content changed in V1
+        # but whose metadata didn't would otherwise never be recopied, and reconcile would fail forever.
         v1 = {r[0]: r[1:] for r in src.execute(
-            f"SELECT {COLUMNS} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+            f"SELECT {COLUMNS}{', content' if full else ''} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
             (org_id, start, end))}
+        if full:
+            v1 = {mid: row[:-1] + (hasher.content_ref(row[-1]),) for mid, row in v1.items()}
         cell = {r[0]: r[1:] for r in dst.execute(
-            f"SELECT {COLUMNS} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
+            f"SELECT {COLUMNS}{', content_ref' if full else ''} FROM messages WHERE org_id = %s AND id >= %s AND id < %s",
             (org_id, start, end))}
 
         ids = sorted(set(v1) - set(cell))

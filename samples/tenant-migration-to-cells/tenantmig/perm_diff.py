@@ -7,7 +7,7 @@ import itertools
 
 import psycopg
 
-from tenantmig import settings
+from tenantmig import identities, settings
 
 
 def _old_decision(perms: list[tuple[str, str, str]], resource: str, action: str) -> bool:
@@ -16,7 +16,7 @@ def _old_decision(perms: list[tuple[str, str, str]], resource: str, action: str)
 
 
 def diff_org(org_id: str) -> dict:
-    with psycopg.connect(settings.V1_AUTH_DSN) as auth:
+    with psycopg.connect(identities.tenant_dsn(settings.V1_AUTH_DSN, org_id)) as auth:
         users = [r[0] for r in auth.execute("SELECT id FROM users WHERE org_id = %s ORDER BY id", (org_id,))]
         rows = auth.execute("""
             SELECT ur.user_id, rp.resource, rp.action, rp.effect
@@ -30,7 +30,7 @@ def diff_org(org_id: str) -> dict:
     for uid, res, act, eff in rows:
         perms.setdefault(uid, []).append((res, act, eff))
 
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
+    with psycopg.connect(identities.tenant_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as mgmt:
         granted = set(mgmt.execute("""
             SELECT g.principal_id, g.resource, g.action FROM grants g
             JOIN principals p ON p.id = g.principal_id WHERE p.org_id = %s""", (org_id,)).fetchall())

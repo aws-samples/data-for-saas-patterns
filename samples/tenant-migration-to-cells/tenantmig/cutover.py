@@ -13,18 +13,15 @@ from datetime import datetime, timezone
 
 import psycopg
 
-from tenantmig import content_job, config_job, object_job, perm_diff, placement, reconcile, settings
+from tenantmig import content_job, config_job, identities, object_job, perm_diff, placement, reconcile, settings
 from tenantmig.store import ContentStore
 
-PLACEMENT_DDL = placement.DDL
-_ensure = placement.ensure
 _set = placement.set_status
 
 
 def where(org_id: str) -> dict:
     """What the router would do for this tenant."""
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
-        _ensure(c)
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as c:
         row = c.execute("SELECT status, cell, updated_at FROM tenant_placement WHERE org_id = %s", (org_id,)).fetchone()
         log = c.execute("SELECT status, cell, note, at FROM tenant_placement_log WHERE org_id = %s ORDER BY id",
                         (org_id,)).fetchall()
@@ -49,7 +46,7 @@ def _missing_secrets(org_id: str) -> list[str]:
         return []
     import boto3
     from botocore.exceptions import ClientError
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as conn:
+    with psycopg.connect(identities.tenant_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as conn:
         refs = [r[0] for r in conn.execute("SELECT secret_ref FROM connectors WHERE org_id = %s", (org_id,))]
     sm = boto3.client("secretsmanager", region_name=settings.S3_REGION)
     missing = []
@@ -65,6 +62,15 @@ def _missing_secrets(org_id: str) -> list[str]:
 
 
 def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = None) -> dict:
+    """See _cutover. Marks the migration steps it calls as running under this tenant's lock."""
+    token = placement.HELD_BY_CUTOVER.set(True)
+    try:
+        return _cutover(org_id, cell, drain_seconds)
+    finally:
+        placement.HELD_BY_CUTOVER.reset(token)
+
+
+def _cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = None) -> dict:
     """Flip and Redirect: freeze writes, drain, final delta, verify, then route the tenant to its cell.
 
     - Only a tenant on `v1` (or `frozen`, left by a crashed run) can be cut over, and only one
@@ -85,10 +91,9 @@ def cutover(org_id: str, cell: str | None = None, drain_seconds: int | None = No
     # rows always go to the database at V2_CELL_MESSAGING_DSN: point that at the cell you mean.
     cell = cell or settings.CELL_ID
     drain = settings.PLACEMENT_CACHE_TTL_SECONDS if drain_seconds is None else drain_seconds
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
-        _ensure(mgmt)
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as mgmt:
         if not mgmt.execute("SELECT pg_try_advisory_lock(hashtext('cutover:' || %s))", (org_id,)).fetchone()[0]:
-            raise SystemExit(f"Another cutover is already running for {org_id}.")
+            raise SystemExit(f"Another cutover or migration step is already running for {org_id}.")
         row = mgmt.execute("SELECT status FROM tenant_placement WHERE org_id = %s", (org_id,)).fetchone()
         status = row[0] if row else "v1"
         mgmt.commit()
@@ -142,18 +147,19 @@ def forget(org_id: str, confirm: bool = False, store: ContentStore | None = None
 
     Without confirm=True this is a dry run that reports what would be deleted.
     """
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
-        _ensure(mgmt)
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as mgmt:
         row = mgmt.execute("SELECT status FROM tenant_placement WHERE org_id = %s", (org_id,)).fetchone()
     if not row or row[0] != "v2":
         raise SystemExit(f"Refusing to forget {org_id}: it is not cut over (status {row[0] if row else 'v1'}).")
 
     store = store or ContentStore()
     keys = []
-    for page in store.s3.get_paginator("list_objects_v2").paginate(Bucket=settings.V1_SHARED_BUCKET, Prefix=f"{org_id}/"):
+    for page in store.s3.get_paginator("list_objects_v2").paginate(Bucket=settings.V1_SHARED_BUCKET, Prefix=f"{org_id}/",
+                                                   **store.owner_kwargs()):
         keys += [o["Key"] for o in page.get("Contents", [])]
 
-    with psycopg.connect(settings.V1_MESSAGING_DSN) as msg, psycopg.connect(settings.V1_AUTH_DSN) as auth:
+    with psycopg.connect(identities.tenant_dsn(settings.V1_MESSAGING_DSN, org_id)) as msg, \
+            psycopg.connect(identities.tenant_dsn(settings.V1_AUTH_DSN, org_id)) as auth:
         counts = {
             "messages": msg.execute("SELECT count(*) FROM messages WHERE org_id = %s", (org_id,)).fetchone()[0],
             "connector_configs": msg.execute("SELECT count(*) FROM connector_configs WHERE org_id = %s", (org_id,)).fetchone()[0],
@@ -177,11 +183,12 @@ def forget(org_id: str, confirm: bool = False, store: ContentStore | None = None
         msg.execute("DELETE FROM organisations WHERE id = %s", (org_id,))
     for i in range(0, len(keys), 1000):
         resp = store.s3.delete_objects(Bucket=settings.V1_SHARED_BUCKET,
-                                       Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]})
+                                       Delete={"Objects": [{"Key": k} for k in keys[i:i + 1000]]},
+                                       **store.owner_kwargs())
         if resp.get("Errors"):
             raise RuntimeError(f"forget: {len(resp['Errors'])} objects not deleted (re-run forget): {resp['Errors'][:3]}")
 
-    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as mgmt:
+    with psycopg.connect(identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id)) as mgmt:
         mgmt.execute("INSERT INTO tenant_placement_log (org_id, status, cell, note) "
                      "SELECT org_id, status, cell, 'V1 copy deleted (forget)' FROM tenant_placement WHERE org_id = %s",
                      (org_id,))

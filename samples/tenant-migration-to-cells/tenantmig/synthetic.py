@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 
-from tenantmig import settings
+from tenantmig import identities, settings
 
 CHANNELS = ["email", "chat", "voice", "video", "sms", "social"]
 RESOURCES = ["record", "collection", "policy", "export", "activity_log", "connector"]
@@ -81,11 +81,15 @@ def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, object
 
             for ctype in ("smtp_journal", "chat_api", "voice_capture"):
                 conn_id += 1
+                credentials = f"FAKE-SECRET-{rng.getrandbits(64):x}"
                 msg.execute(
                     "INSERT INTO connector_configs VALUES (%s, %s, %s, %s, %s)",
                     (conn_id, org, ctype, psycopg.types.json.Jsonb({"region": "us-east-2", "poll_seconds": 60}),
-                     f"FAKE-SECRET-{rng.getrandbits(64):x}"),
+                     credentials),
                 )
+                # The credential moves to Secrets Manager under the name the migration records. Synthetic
+                # data does this step itself; a real migration needs its own audited path.
+                identities.put_secret_value(identities.connector_secret_name(org, conn_id), credentials)
 
             # Roles: admin (wildcard), reviewer, exporter (with a wildcard deny), readonly.
             roles = {}
@@ -112,6 +116,8 @@ def generate(orgs: int = 3, messages_per_org: int = 2_000, seed: int = 7, object
                 for name in rng.sample(list(roles), k=rng.randint(1, 2)):
                     auth.execute("INSERT INTO user_roles VALUES (%s, %s)", (user_id, roles[name]))
     _shared_bucket_objects(org_ids, objects_per_org, rng)
+    for org in org_ids:
+        identities.provision_tenant(org)    # each tenant gets its own login role and password
     return org_ids
 
 

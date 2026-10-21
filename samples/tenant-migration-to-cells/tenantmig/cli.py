@@ -5,8 +5,8 @@ import signal
 
 import psycopg
 
-from tenantmig import (config_job, content_job, cutover, object_job, perm_diff, placement, reconcile,
-                       settings, synthetic)
+from tenantmig import (config_job, content_job, cutover, identities, object_job, perm_diff, placement,
+                       reconcile, settings, synthetic)
 
 
 def _print(obj) -> None:
@@ -17,11 +17,25 @@ def _on_sigterm(signum, frame):
     raise SystemExit(f"terminated by signal {signum}")
 
 
-def wake(attempts: int = 12, delay: float = 10.0) -> None:
+ADMIN_COMMANDS = {"generate", "orgs", "init", "reset", "purge-buckets", "demo"}
+
+
+def _wake_targets(cmd: str, org_id: str | None) -> list[tuple[str, str]]:
+    """The databases this command will connect to, as the identity it will use. A job task holds only
+    its tenant's logins, so it wakes the databases through those logins and nothing else."""
+    if cmd in ADMIN_COMMANDS or not org_id:
+        return [("v1-messaging", settings.V1_MESSAGING_DSN), ("v1-auth", settings.V1_AUTH_DSN),
+                ("v2-cell-messaging", settings.V2_CELL_MESSAGING_DSN), ("v2-management", settings.V2_MANAGEMENT_DSN)]
+    return [("v1-messaging", identities.tenant_dsn(settings.V1_MESSAGING_DSN, org_id)),
+            ("v1-auth", identities.tenant_dsn(settings.V1_AUTH_DSN, org_id)),
+            ("v2-cell-messaging", identities.tenant_dsn(settings.V2_CELL_MESSAGING_DSN, org_id)),
+            ("v2-management", identities.control_dsn(settings.V2_MANAGEMENT_DSN, org_id))]
+
+
+def wake(targets: list[tuple[str, str]], attempts: int = 12, delay: float = 10.0) -> None:
     """Aurora Serverless v2 auto-pauses when idle; the first connection resumes it. Retry until all answer."""
     import time
-    for name, dsn in (("v1-messaging", settings.V1_MESSAGING_DSN), ("v1-auth", settings.V1_AUTH_DSN),
-                      ("v2-cell-messaging", settings.V2_CELL_MESSAGING_DSN), ("v2-management", settings.V2_MANAGEMENT_DSN)):
+    for name, dsn in targets:
         for i in range(attempts):
             try:
                 with psycopg.connect(dsn, connect_timeout=20) as c:
@@ -40,14 +54,13 @@ def _orgs() -> list[str]:
 
 
 def init_schemas() -> list[str]:
-    """Create the sample's schemas, catalogue and read-only role.
+    """Create the sample's schemas and the admin-side setup: roles, grants, policies and the fdw.
 
-    This WRITES TO THE V1 DATABASES: it creates the catalogue tables, creates the
-    `tenantmig_reader` role and sets its password, and grants it SELECT. That is why it is
-    guarded like the destructive commands. A production team applies its own schema and
-    creates the reader role from `tenantmig/reader.sql` by hand instead.
+    This writes to the V1 databases (it creates the schemas), so it is guarded like the destructive
+    commands. A production team applies its own schema and runs the same setup from
+    `tenantmig/identities.py` and `sql/rls/` instead.
     """
-    _require_sandbox("create schemas and the reader role (this writes to V1)")
+    _require_sandbox("create schemas and roles (this writes to V1)")
     import os
     from pathlib import Path
     sql_dir = Path(os.getenv("SQL_DIR", Path(__file__).resolve().parent.parent / "sql"))
@@ -63,29 +76,29 @@ def init_schemas() -> list[str]:
             if c.execute("SELECT to_regclass(%s)", (f"public.{probe}",)).fetchone()[0] is None:
                 c.execute((sql_dir / path).read_text())
                 done.append(path)
-    _ensure_reader()
+    _ensure_tenant_isolation(sql_dir)
     return done
 
 
-def _ensure_reader() -> None:
-    """Read-only migration role on both V1 databases, used by postgres_fdw. No SELECT on credentials."""
-    from pathlib import Path
-    from psycopg import sql
-    role_sql = (Path(__file__).resolve().parent / "reader.sql").read_text()
-    grants = {
-        settings.V1_MESSAGING_DSN: ["GRANT SELECT ON organisations TO tenantmig_reader",
-                                    "GRANT SELECT (id, org_id, connector_type, settings) ON connector_configs TO tenantmig_reader"],
-        settings.V1_AUTH_DSN: ["CREATE TABLE IF NOT EXISTS catalogue_resources (name text PRIMARY KEY)",
-                               "CREATE TABLE IF NOT EXISTS catalogue_actions (name text PRIMARY KEY)",
-                               "GRANT SELECT ON users, roles, user_roles, role_permissions, "
-                               "catalogue_resources, catalogue_actions TO tenantmig_reader"],
-    }
-    for dsn, statements in grants.items():
+def _ensure_tenant_isolation(sql_dir) -> None:
+    """Admin setup: roles, grants, row-level policies and the fdw (finding 4 and the duty split).
+
+    Order matters. The placement table must exist before the control role is granted on it, the
+    roles before the policies and fdw grants refer to them. Idempotent.
+    """
+    from tenantmig import config_job, identities, placement
+    dsns = {"v1_messaging": settings.V1_MESSAGING_DSN, "v1_auth": settings.V1_AUTH_DSN,
+            "v2_cell_messaging": settings.V2_CELL_MESSAGING_DSN, "v2_management": settings.V2_MANAGEMENT_DSN}
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
+        placement.ensure(c)
+    identities.setup_roles(dsns)
+    with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
+        config_job.setup_fdw(c)
+    for label, dsn in dsns.items():
         with psycopg.connect(dsn) as c:
-            c.execute(role_sql)
-            c.execute(sql.SQL("ALTER ROLE tenantmig_reader PASSWORD {}").format(sql.Literal(settings.READER_PASSWORD)))
-            for s in statements:
-                c.execute(s)
+            c.execute((sql_dir / "rls" / "identity.sql").read_text())
+            c.execute((sql_dir / "rls" / f"{label}.sql").read_text())
+            c.commit()
 
 
 def _require_sandbox(what: str) -> None:
@@ -113,17 +126,34 @@ def purge_buckets() -> list[str]:
              or b["Name"] in (settings.V1_SHARED_BUCKET, settings.MIGRATION_BUCKET)]
     for n in names:
         _delete_bucket(store, n)
+    if settings.SECRETS_BACKEND == "aws":
+        from tenantmig import task_roles
+        task_roles.delete_task_roles()
+        _delete_identity_secrets()
     return names
+
+
+def _delete_identity_secrets() -> None:
+    """Secrets created at run time, so `cdk destroy` doesn't remove them. Without this, the next
+    deploy would find the names still reserved, or reuse passwords from a database that is gone."""
+    import boto3
+    sm = boto3.client("secretsmanager", region_name=settings.S3_REGION)
+    for page in sm.get_paginator("list_secrets").paginate(Filters=[{"Key": "name", "Values": ["tenantmig/"]}]):
+        for secret in page["SecretList"]:
+            if secret["Name"].startswith("tenantmig/V"):
+                continue      # CDK-managed: removed by cdk destroy
+            sm.delete_secret(SecretId=secret["ARN"], ForceDeleteWithoutRecovery=True)
 
 
 def reset() -> None:
     """Empty the V2 targets and delete per-tenant buckets, so a demo can be re-run. Sandbox only."""
     _require_sandbox("reset the V2 targets")
+    from tenantmig import placement
     from tenantmig.store import ContentStore
     with psycopg.connect(settings.V2_CELL_MESSAGING_DSN) as c:
         c.execute("TRUNCATE messages, organisations, migration.org_state CASCADE")
     with psycopg.connect(settings.V2_MANAGEMENT_DSN) as c:
-        c.execute(cutover.PLACEMENT_DDL)
+        c.execute(placement.DDL)
         c.execute("TRUNCATE grants, principals, connectors, id_map, organisations, "
                   "tenant_placement, tenant_placement_log CASCADE")
     store = ContentStore()
@@ -189,14 +219,14 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="tenantmig", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    g = sub.add_parser("generate", help="replace V1 with synthetic data (TENANTMIG_SANDBOX=1 only)")
+    g = sub.add_parser("generate", help="replace V1 with synthetic data and empty V2 (TENANTMIG_SANDBOX=1 only)")
     g.add_argument("--orgs", type=int, default=3)
     g.add_argument("--messages", type=int, default=2_000)
 
     sub.add_parser("orgs", help="list V1 organisations")
     sub.add_parser("reset", help="empty V2 targets and delete per-tenant buckets (TENANTMIG_SANDBOX=1 only)")
     sub.add_parser("purge-buckets", help="delete every bucket the sample created, before cdk destroy (sandbox only)")
-    sub.add_parser("init", help="create schemas, catalogue and reader role; writes to V1 (sandbox only)")
+    sub.add_parser("init", help="create schemas, roles, policies and the fdw; writes to V1 (sandbox only)")
     for name in ("migrate-content", "migrate-config", "migrate-objects", "diff-permissions", "reconcile"):
         sp = sub.add_parser(name)
         sp.add_argument("org_id")
@@ -229,8 +259,11 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_sigterm)
     if getattr(a, "org_id", None):
         a.org_id = placement.normalise_org_id(a.org_id)
-    wake()
+    wake(_wake_targets(a.cmd, getattr(a, "org_id", None)))
     if a.cmd == "generate":
+        # Generate numbers messages from 1 again, so the V2 targets must be emptied first. Otherwise
+        # the new IDs collide with rows the previous run already copied into the cell.
+        reset()
         _print(synthetic.generate(orgs=a.orgs, messages_per_org=a.messages))
     elif a.cmd == "orgs":
         _print(_orgs())

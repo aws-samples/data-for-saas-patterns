@@ -5,8 +5,9 @@ In production build the manifest from S3 Inventory (filtered by the org prefix) 
 by listing: a shared bucket in a large estate can hold billions of objects, and listing them
 all is slow and expensive. Local MinIO has no Batch Operations, so the copy is done directly.
 
-Only objects the destination is missing go into the manifest, so a re-run (and the re-check
-during cutover) costs one LIST rather than a full re-copy.
+Only objects the destination is missing, or holds a different copy of (size or ETag differ),
+go into the manifest. A re-run and the re-check during cutover cost one LIST rather than a full
+re-copy, and a source object overwritten after its first copy is copied again.
 
 Watch-outs at scale:
 - A copy lands in the destination bucket's default storage class unless the job sets one.
@@ -30,24 +31,25 @@ from tenantmig.store import ContentStore, org_bucket
 DEST_PREFIX = "originals/"
 
 
-def _source_keys(store: ContentStore, org_id: str) -> list[tuple[str, str]]:
-    keys = []
-    for page in store.s3.get_paginator("list_objects_v2").paginate(Bucket=settings.V1_SHARED_BUCKET, Prefix=f"{org_id}/"):
-        keys += [(o["Key"], o["ETag"]) for o in page.get("Contents", [])]
-    return keys
+def _source_keys(store: ContentStore, org_id: str) -> dict[str, tuple[int, str]]:
+    return store.list_objects(settings.V1_SHARED_BUCKET, prefix=f"{org_id}/")
 
 
+@placement.guarded("copy shared-bucket objects")
 def migrate_objects(org_id: str, store: ContentStore | None = None) -> dict:
-    placement.require_migratable(org_id, "copy shared-bucket objects")
     store = store or ContentStore()
     dest = org_bucket(org_id)
     store.ensure_bucket(dest)
     keys = _source_keys(store, org_id)
     if not keys:
         return {"org_id": org_id, "source_objects": 0, "mode": "none"}
-    # Copy only what the destination lacks: one LIST instead of re-copying everything.
-    already = store.list_keys(dest, prefix=DEST_PREFIX)
-    todo = [(k, e) for k, e in keys if DEST_PREFIX + k not in already]
+    # Copy only what the destination lacks or holds a different version of: one LIST instead of
+    # re-copying everything. Presence alone is not enough: a source object overwritten after its
+    # first copy keeps the same key.
+    already = store.list_objects(dest, prefix=DEST_PREFIX)
+    todo = [k for k, meta in keys.items()
+            if DEST_PREFIX + k not in already or not store.same_content(
+                settings.V1_SHARED_BUCKET, k, meta, dest, DEST_PREFIX + k, already[DEST_PREFIX + k])]
     if not todo:
         return {"org_id": org_id, "mode": "up to date", "source_objects": len(keys),
                 "already_present": len(keys), "copied": 0}
@@ -58,9 +60,9 @@ def migrate_objects(org_id: str, store: ContentStore | None = None) -> dict:
 
 def _copy_direct(store, org_id, dest, todo, source_total) -> dict:
     copied = 0
-    for key, _ in todo:
+    for key in todo:
         store.s3.copy_object(Bucket=dest, Key=DEST_PREFIX + key,
-                             CopySource={"Bucket": settings.V1_SHARED_BUCKET, "Key": key})
+                             CopySource={"Bucket": settings.V1_SHARED_BUCKET, "Key": key}, **store.owner_kwargs())
         copied += 1
     return {"org_id": org_id, "mode": "direct (local)", "source_objects": source_total,
             "already_present": source_total - len(todo), "copied": copied}
@@ -71,7 +73,7 @@ def _copy_batch_operations(store, org_id, dest, todo, source_total) -> dict:
     manifest_key = f"_manifests/{org_id}/{int(time.time())}.csv"
     buf = io.StringIO()
     w = csv.writer(buf)
-    for key, _ in todo:
+    for key in todo:
         # Batch Operations requires URL-encoded object keys in a CSV manifest. Without this,
         # keys containing a space, +, % or any non-ASCII character fail their task.
         w.writerow([settings.V1_SHARED_BUCKET, quote(key, safe="")])
@@ -81,7 +83,7 @@ def _copy_batch_operations(store, org_id, dest, todo, source_total) -> dict:
     # Manifests and reports live in a separate migration bucket, not in the V1 shared bucket.
     store.ensure_bucket(settings.MIGRATION_BUCKET)
     put = store.s3.put_object(Bucket=settings.MIGRATION_BUCKET, Key=manifest_key, Body=buf.getvalue().encode(),
-                              ServerSideEncryption="AES256")
+                              ServerSideEncryption="AES256", **store.owner_kwargs())
 
     s3control = boto3.client("s3control", region_name=settings.S3_REGION)
     job = s3control.create_job(

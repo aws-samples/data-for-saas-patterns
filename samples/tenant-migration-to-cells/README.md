@@ -28,7 +28,8 @@ Worth knowing about the design:
 * **[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) (`If-None-Match`) do the deduplication.** Identical content is stored once, and a re-run never stores a second copy — though a rejected PUT is still a billed request, so re-runs are cheap, not free.
 * **Objects are written before rows, and rows commit with the watermark.** A row never points at missing content, and a crashed pass resumes from its last committed batch. An advisory lock allows one pass per tenant.
 * **The permissions harness doesn't reuse the transform.** It evaluates the V1 model in its own code over the same catalogue, so a bug in the transform can't hide itself. `--inject-bug` shows it catching one.
-* **Credentials can't travel the migration path.** The fdw sees only declared columns, without `credentials`, as a role that couldn't select them anyway.
+* **Credentials can't travel the migration path.** The fdw sees only declared columns, without `credentials`, and the tenant's own login can't read that column either.
+* **The database enforces tenant isolation.** Each tenant has its own login roles, and row-level security keeps every query to that tenant. On AWS each tenant's job runs under its own task role. Setup runs as the owner. See the guide's security table.
 * **Reconciliation checks more than counts.** Counts and checksums can pass while objects are missing; checking that every reference resolves catches that.
 
 ## Run it
@@ -37,7 +38,7 @@ Needs Python 3.11+ and [uv](https://docs.astral.sh/uv/); locally also PostgreSQL
 
 ```bash
 uv venv && uv pip install -e .
-./scripts/local-up.sh && source .local/env      # sets TENANTMIG_SANDBOX=1, creates the reader role
+./scripts/local-up.sh && source .local/env      # sets TENANTMIG_SANDBOX=1, creates schemas, roles and policies
 # or: docker compose up -d && source scripts/docker.env && tenantmig init
 
 tenantmig demo                 # end to end for one tenant (resets the V2 targets)

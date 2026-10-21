@@ -28,8 +28,9 @@ V2_CELL_MESSAGING_DSN = _dsn("V2_CELL_MESSAGING", 5418, "messaging")
 V2_MANAGEMENT_DSN = _dsn("V2_MANAGEMENT", 5419, "management")
 
 
-READER_USER = "tenantmig_reader"
-READER_PASSWORD = os.getenv("TENANTMIG_READER_PASSWORD", "local-reader")
+# Where tenant, migrator and control passwords live: "local" (a file under .local/, for the local
+# stack) or "aws" (Secrets Manager, for the sandbox task).
+SECRETS_BACKEND = os.getenv("TENANTMIG_SECRETS", "local")
 # postgres_fdw needs sslmode=verify-full plus a CA to authenticate the server. The fdw client
 # is the management database instance itself, not this process, so this has to name something
 # that instance can read: "system" uses its trust store (PostgreSQL 16+), which on Aurora
@@ -44,9 +45,6 @@ def _fdw(prefix: str, local_port: int, dbname: str) -> dict:
         port=os.getenv(f"FDW_{prefix}_PORT") or os.getenv(f"{prefix}_PORT",
                                                           "5432" if os.getenv(f"{prefix}_HOST") else str(local_port)),
         dbname=os.getenv(f"{prefix}_DBNAME", dbname),
-        # The fdw connects as the read-only migration role, never as the master user.
-        reader_user=READER_USER,
-        reader_password=READER_PASSWORD,
         sslmode=os.getenv(f"FDW_{prefix}_SSLMODE") or os.getenv(
             f"{prefix}_SSLMODE", "require" if os.getenv(f"{prefix}_HOST") else "disable"),
     )

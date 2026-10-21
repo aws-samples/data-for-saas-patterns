@@ -92,7 +92,7 @@ On AWS:
 
 ```bash
 cd infra && npm install && npx cdk bootstrap && npx cdk deploy
-cd .. && ./scripts/aws-run.sh init                 # schemas, catalogue, read-only fdw role
+cd .. && ./scripts/aws-run.sh init                 # schemas, roles, policies and the fdw (admin)
 ./scripts/aws-run.sh demo --messages 2000
 ./scripts/aws-run.sh demo --inject-bug             # exits non-zero: NOT READY TO CUT OVER
 ./scripts/aws-run.sh purge-buckets                 # buckets are created at run time, so purge
@@ -122,7 +122,7 @@ PUTs run 32 at a time (`S3_WORKERS`); with small objects per-request latency is 
 
 `INSERT … SELECT` from the management database over [`postgres_fdw`](https://docs.aws.amazon.com/prescriptive-guidance/latest/aurora-postgresql-integration/remote-postgresql-databases.html):
 
-* **Credentials can't travel this path.** The foreign table doesn't declare the `credentials` column, and the fdw connects as `tenantmig_reader`, which has no `SELECT` on it. Connectors get a Secrets Manager `secret_ref` instead, and credentials move separately.
+* **Credentials can't travel this path.** The foreign table doesn't declare the `credentials` column. The migrator reads V1 as the tenant's own login, which has no `SELECT` on that column either. Connectors get a Secrets Manager `secret_ref` instead.
 * **Wildcards expand against the application catalogue** (`catalogue_resources`, `catalogue_actions`) — the product's real list of resources and actions — not against the rules. So a resource no rule names is still granted to a `*` role. In the synthetic data nothing names `connector` or `approve`, and admins still get both. Denies are subtracted.
 * **Every run converges V2 on V1**: changed rows updated, rows deleted in V1 deleted in V2, grants rebuilt. A config change made before the freeze is picked up by the final config pass.
 
@@ -132,7 +132,7 @@ For every (user, resource, action) in the catalogue, the harness evaluates the *
 
 ### Objects (step 7)
 
-[S3 Batch Operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-examples-copy.html) Copy, one job per tenant, from a CSV manifest in a separate migration bucket; failed-task reports land beside it. Only keys the destination lacks go in the manifest, so a re-run (and the cutover re-check) costs one LIST. The step fails — and so rolls cutover back — if the job doesn't complete within `BATCH_TIMEOUT_SECONDS` or any task fails. MinIO has no Batch Operations, so local runs copy directly.
+[S3 Batch Operations](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-examples-copy.html) Copy, one job per tenant, from a CSV manifest in a separate migration bucket; failed-task reports land beside it. Only keys the destination lacks, or holds a different copy of (size or ETag differ), go in the manifest, so a re-run (and the cutover re-check) costs one LIST. A source object overwritten after its first copy is copied again. The step fails — and so rolls cutover back — if the job doesn't complete within `BATCH_TIMEOUT_SECONDS` or any task fails. MinIO has no Batch Operations, so local runs copy directly.
 
 ### Reconciliation (step 8) — the gate
 
@@ -144,27 +144,27 @@ Passes only if all five hold:
 | Checksums match per ID range — an ordered hash over (id, channel, sender, sent_at, content hash) per 50,000 IDs, V1's content hash computed **in SQL** | Values and content are identical, and the job's hashing agrees with the database's. Per-range keeps each aggregate well under PostgreSQL's 1 GB text limit at any tenant size, and `mismatched_id_ranges` says where to look |
 | Every distinct `content_ref` resolves to an object | Counts and checksums can pass while objects are missing. In testing this is the check that caught real failures |
 | A sampled object round-trips against V1 content | End-to-end content check |
-| Every shared object was copied | Step 7 finished |
+| Every shared object was copied, and the copy has the same bytes | Step 7 finished. Single-part objects are compared by ETag (their MD5). Multipart objects are compared by a full-object SHA-256, because a copy of a multipart object gets a different ETag even when the bytes match (verified on S3). That's a read of each multipart source, so for a large archive run a Batch Operations [compute checksum](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-compute-checksums.html) job on both sides instead |
 
 ### Cutover, and repair
 
-`cutover` refuses unless the tenant is `v1` (or `frozen` from a crashed run — cutting over a `v2` tenant would route a live tenant back to V1 and strand its V2 writes), takes a per-tenant lock, freezes, drains, runs the final content and config passes, re-copies any missing objects, re-verifies, then redirects. It rolls back to `v1` and records why on verification failure **or any exception or interruption** (`SIGTERM`, `Ctrl-C`, an S3 error, a database timeout).
+`cutover` runs only on a `v1` tenant (or a `frozen` one left by a crash). It freezes writes, drains, runs the final content and config passes, re-copies missing objects, re-verifies, then redirects. Any failure, exception or interruption (`SIGTERM`, `Ctrl-C`) rolls it back to `v1`.
 
-A hard kill (`SIGKILL`, a dead host, the management database unreachable mid-rollback) can still leave a tenant `frozen` with writes paused. Re-running is safe and is the fix; in production **alarm on it** — `where` reports `frozen_for_seconds`.
+A `SIGKILL` or a dead host can leave a tenant `frozen`. Re-running is safe. In production, alarm on `frozen_for_seconds` from `where`.
 
-**The drain is weaker than it looks.** It bounds when the router *decides* where a write goes, not when that write *commits*, and it does nothing about writers that never read `tenant_placement`:
+**The drain is weaker than it looks.** It limits when the router *decides* where a write goes, not when the write *commits*:
 
 | Writer | Stopped by the drain? |
 |---|---|
-| A request the router already dispatched to V1 | **No** — a slow request or a client retry commits later |
-| Connector ingestion, queue consumers, batch jobs | **No** — they write directly. The sample's own `smtp_journal`, `chat_api` and `voice_capture` connectors are exactly this |
-| A new request after every router cache refreshed | Yes |
+| A request the router already sent to V1 | No: a slow request or a retry commits later |
+| Connectors, queue consumers, batch jobs | No: they never read `tenant_placement` |
+| A new request, after every router cache refreshed | Yes |
 
-So treat `--drain-seconds` (default `PLACEMENT_CACHE_TTL_SECONDS`) as a convenience for a router-only write path. For anything else, **block writes in V1** and pass `--drain-seconds 0`. Strongest first: a trigger or row-level security policy on the V1 tables keyed on tenant status (the only option that also stops connectors and batch jobs); pausing the tenant's ingestion at source; revoking its write grants, which only works if tenants have their own database roles rather than a shared pooled one. None of these stop an already-open transaction, so then wait for in-flight writes to drain — for example until no session in `pg_stat_activity` has been writing to those tables since before the freeze.
+For anything but a router-only write path, block writes in V1 and pass `--drain-seconds 0`. The strongest way is a trigger or row-level policy on the V1 tables that rejects writes unless the tenant is `v1`. Then wait for open transactions to finish.
 
-`--repair` converges what reconciliation reports: it backfills missing rows, re-copies rows whose V1 values differ, and deletes cell rows whose V1 row is gone. `forget` is a dry run unless `--confirm`, deletes messages in committed chunks of 10,000, fails if S3 reports an object it couldn't delete, is safe to re-run, and refuses unless the tenant is `v2`.
+`--repair` backfills missing rows, re-copies rows that differ, and deletes cell rows whose V1 row is gone. `forget` is a dry run unless `--confirm`, deletes in chunks of 10,000, and needs the tenant to be `v2`.
 
-The router is part of your application. It reads `tenant_placement`: `v1` → serve from V1; `frozen` → reads from V1, writes rejected or queued; `v2` → the cell. A DynamoDB mapping table, as in the [sharding reference architecture](../../../reference-architectures/relational-database-sharding.md), works equally well.
+The router reads `tenant_placement`: `v1` serves from V1, `frozen` rejects writes, and `v2` serves from the cell. A DynamoDB mapping table, as in the [sharding reference architecture](../../../reference-architectures/relational-database-sharding.md), works equally well.
 
 ## Cutover runbook
 
@@ -173,10 +173,10 @@ Per tenant. Large tenants need several Clone cycles first.
 1. Clone until deltas are small.
 2. Verify: 0 disagreements and reconciliation passing. Fix and repeat until both are clean.
 3. Confirm cell monitoring: error rate, latency, [`AuroraGlobalDBReplicationLag`](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/Aurora.AuroraMonitoring.Metrics.html).
-4. Confirm the cell's IAM and KMS access for the tenant bucket is ready to switch on.
+4. **Switch the cell's IAM and KMS access for the tenant bucket on, before the cutover.** The serving identity has to be able to read the tenant's data before the router can send it traffic. Granting access to a tenant the router still sends to V1 is harmless.
 5. **Size the freeze from the tenant, not the delta.** The delta is small, but re-verification re-hashes every V1 content row, lists the bucket and walks every ID range, so it scales with the whole dataset. The object step is incremental; the checksum pass is not. Measure it on a copy of the tenant before agreeing a window, and for a very large tenant verify unchanged ranges before the freeze.
 6. Run `cutover --drain-seconds N` — your router's cache TTL plus a margin, or 0 if writes are blocked in V1.
-7. Switch the cell's access on. Remove V1's write access to the tenant's data.
+7. Remove V1's write access to the tenant's data.
 8. Smoke-test as the tenant: recent messages, and permissions for a known admin and a known read-only user.
 9. Watch the cell. Rolling back after Redirect means setting `v1` again — V1 still holds the data, but writes made in V2 would need replaying, so agree that window in advance.
 10. After the retention window: `forget`, review the output, then `forget --confirm`.
@@ -196,17 +196,30 @@ Per tenant. Large tenants need several Clone cycles first.
 
 ## Security
 
-| | |
+| Control | What it does |
 |---|---|
-| Credentials | Never travel the migration path: no `credentials` column on the foreign table, a read-only fdw role with no `SELECT` on it, connectors carrying a Secrets Manager reference, and the job's own database credentials injected from Secrets Manager. The reader's password is stored **in clear text** in the management database's `pg_user_mapping` — that is how `postgres_fdw` works, so keep the role read-only and treat that database's superuser as equivalent to it. `migrate-config` reapplies the mapping every run, so rotation needs no manual drop |
-| Bucket names | Guessable (`<prefix><tenant-uuid>`) and globally unique, so every call sends `ExpectedBucketOwner`, `head_bucket` fails closed on 403/301, and both roles are conditioned on `aws:ResourceAccount`. A bucket pre-created under one of those names in another account fails the call instead of receiving tenant content. The Batch Operations trust policy uses `aws:SourceAccount` and `aws:SourceArn` |
-| TLS | `sslmode=require` encrypts but does not verify, so use `verify-full` with the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/UsingWithRDS.SSL.html) for the job's own connections in production (`V1_MESSAGING_SSLMODE=verify-full` and friends, with the bundle mounted). **The `postgres_fdw` hop can only be encrypted, not verified**: its client is the managed Aurora instance, not your container, and on Aurora PostgreSQL 18 `verify-full` fails with `CERTIFICATE_VERIFY_FAILED` both with a file path (no readable path on a managed host) and with `sslrootcert=system` (the RDS CA is not a public root). Mitigated the other way: isolated subnets, a security group admitting only the two V1 clusters, and a narrowly granted read-only role. To get it verified, do the join in your own job instead of in the database |
-| Guards | `generate` (truncates V1), `init` (grants on V1), `reset`, `purge-buckets` and `demo` need `TENANTMIG_SANDBOX=1`. Every migration step checks `tenant_placement` and refuses once a tenant is `v2`, so a stray command can't overwrite live data with stale V1 data — or, after `forget`, empty it |
-| Network and least privilege | Databases in isolated subnets with no route out, Block Public Access on buckets, no inbound rules on the task. The task role reaches only this account's buckets with the sample's prefix, plus the cell key, and `iam:PassRole` only the Batch Operations role |
-| Replica | The final pass, `--repair` and reconciliation deliberately ignore `V1_MESSAGING_READ_DSN` and read the writer: replica lag at cutover would make a missing row look like a matching count. Give the replica user `SELECT` on `messages` and `organisations` — `tenantmig_reader` is not that user |
-| In production | Deletion protection on, backup retention longer than the sandbox's one day, and the reader's password rotated |
+| Tenant isolation | Each tenant has its own logins, and row-level security keeps each one to its tenant. The policies read the tenant from the login name, so a session can't pick another tenant. The owner is exempt, so setup and tests use it. |
+| Identities | Per tenant: a **tenant** login (its rows), a **migrator** login (its configuration) and a **control** login (its routing row). Setup runs as the owner, and the job task never gets the owner's password. |
+| Task roles (AWS) | Each tenant's job runs under its own task role. It can read only that tenant's secret and touch only that tenant's buckets. Batch Operations and KMS are shared, because `CreateJob` can't be scoped to one tenant. |
+| Passwords | Secrets Manager on AWS, and one secret per tenant. A step fails if its password is missing. The migrator's fdw mapping stores the tenant's login password in clear text in the management database, as `postgres_fdw` does. Only the owner can read it. |
+| Credentials | The `credentials` column is never copied, and no tenant role can read it. Connectors carry a Secrets Manager reference instead. |
+| Bulk loads | Batched `INSERT`, not `COPY`: PostgreSQL refuses `COPY` into an RLS table for any role that isn't the owner. |
+| Bucket names | Guessable and globally unique, so calls on existing buckets send `ExpectedBucketOwner`. `CreateBucket` doesn't accept it, so creation relies on the task role's name-prefix scope. |
+| TLS | Use `verify-full` with the [RDS CA bundle](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/UsingWithRDS.SSL.html) for the job's own connections in production. The fdw hop can't be verified on Aurora: its client is the managed instance, and `verify-full` fails with `CERTIFICATE_VERIFY_FAILED` even with `sslrootcert=system`. That hop is confined to isolated subnets, and only the management group can reach the V1 clusters. |
+| Guards | `generate`, `init`, `reset`, `purge-buckets` and `demo` need `TENANTMIG_SANDBOX=1`. Every migration step refuses once a tenant is `v2`. |
+| Network | Isolated database subnets with no route out, Block Public Access on buckets, no inbound rules on the task. One security group per cluster role; no group allows itself. |
+| Replica | The final pass, `--repair` and reconciliation read the writer, not `V1_MESSAGING_READ_DSN`. Replica lag at cutover would make a missing row look like a matching count. |
+| In production | Deletion protection, longer backup retention, and tenant passwords rotated (provisioning again applies the new one). |
 
 ## Adapting it
+
+This sample targets one fixed pair of schemas. Each job names its tables and columns as literals, so
+adapting it means rewriting those SQL bindings. The permission model is the largest change: three files
+must change together (`config_job.GRANTS_SQL`, `perm_diff._old_decision` and `sql/v1/auth.sql`). Keep the
+two evaluators separate, or the harness can't catch a transform bug.
+
+What carries over unchanged: conditional-write deduplication, objects before rows, the watermark and
+anti-join deltas, the advisory locks, the per-tenant identities, and the Clone → Flip → Redirect → Forget flow.
 
 | Change | Where |
 |---|---|
@@ -219,6 +232,8 @@ Per tenant. Large tenants need several Clone cycles first.
 | The bulk source: read the snapshot export (Parquet) instead of the live database | `content_job.py` |
 | Manifests from [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) filtered by tenant prefix, rather than listing | `object_job.py` |
 | The router and placement store | `cutover.py`, `placement.py` |
+| Roles, grants and policies: one tenant's logins, the group roles, and the row-level policies | `identities.py`, `sql/rls/` |
+| Per-tenant task roles on AWS: which buckets and secret a tenant's job can touch | `task_roles.py` |
 
 **Moving a tenant between cells** is smaller than moving it off V1, but not free: its rows have to be copied to the new cell's database, and its bucket is encrypted with the old cell's KMS key, so either grant the new cell that key or re-encrypt by copying. Only the routing change is instant.
 

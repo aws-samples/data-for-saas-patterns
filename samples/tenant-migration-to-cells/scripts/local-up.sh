@@ -8,10 +8,16 @@ PG15=/opt/homebrew/opt/postgresql@15/bin
 PG18=/opt/homebrew/opt/postgresql@18/bin
 mkdir -p "$ROOT"
 
+export PGPASSWORD=local   # the admin password on the local stack, for the psql and createdb calls below
+
 start_pg() {  # name bin port db initsql
   local name=$1 bin=$2 port=$3 db=$4 init=$5 dir="$ROOT/$1"
   if [ ! -d "$dir" ]; then
-    "$bin/initdb" -D "$dir" -U postgres --auth=trust -E UTF8 --locale=C >/dev/null
+    # SCRAM over TCP, as on RDS: postgres_fdw refuses a non-superuser connection unless the remote
+    # side asks for a password, so trust auth would hide the very path the isolation relies on.
+    echo local > "$ROOT/.pwfile"
+    "$bin/initdb" -D "$dir" -U postgres --auth-local=trust --auth-host=scram-sha-256 --pwfile="$ROOT/.pwfile" \
+        -E UTF8 --locale=C >/dev/null
   fi
   if ! "$bin/pg_ctl" -D "$dir" status >/dev/null 2>&1; then
     "$bin/pg_ctl" -D "$dir" -o "-p $port -k /tmp" -l "$ROOT/$name.log" -w start >/dev/null
@@ -46,5 +52,5 @@ export TENANTMIG_SANDBOX=1                      # allows reset / purge-buckets o
 export PLACEMENT_CACHE_TTL_SECONDS=2            # local demo: pretend the router caches placement for 2 s
 EOF
 # Read-only fdw role and catalogue tables (idempotent).
-if [ -x .venv/bin/tenantmig ]; then (source "$ROOT/env" && .venv/bin/tenantmig init >/dev/null) && echo "  schemas + migration reader role ready"; fi
+if [ -x .venv/bin/tenantmig ]; then (source "$ROOT/env" && .venv/bin/tenantmig init >/dev/null) && echo "  schemas, roles and policies ready"; fi
 echo "Ready. Run: source .local/env && tenantmig demo"
