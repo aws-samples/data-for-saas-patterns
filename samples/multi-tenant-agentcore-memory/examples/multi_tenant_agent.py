@@ -134,9 +134,9 @@ def invoke(payload: dict, context) -> dict:
             "conversation_id": conversation_id,
         }
     except IsolationError as e:
-        # Bad identifiers (tenant, user or conversation id) or a TVM failure.
+        # Bad identifiers, a TVM failure, or a memory read error.
         logger.warning("invoke rejected: %s", e)
-        return {"error": "request rejected: invalid tenant, user or conversation id, or credentials unavailable"}
+        return {"error": "request rejected: invalid identity, or memory or credentials unavailable"}
     except Exception as e:
         # Full details go to server-side logs only. Exception messages can
         # contain internal identifiers (role ARNs, tenant ids, etc. — see

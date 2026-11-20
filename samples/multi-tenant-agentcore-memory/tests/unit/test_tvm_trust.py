@@ -109,3 +109,28 @@ def test_remove_last_principal_is_refused():
     with _patch(iam), pytest.raises(SystemExit):
         tvm_trust.remove_trust("tvm", [EXEC_ROLE])
     iam.update_assume_role_policy.assert_not_called()
+
+
+def test_tag_value_must_be_non_empty():
+    cond = tvm_trust.trust_policy(ACCOUNT, [EXEC_ROLE])["Statement"][0]["Condition"]
+    assert cond["StringLike"] == {"aws:RequestTag/TenantID": "?*"}
+
+
+def test_other_trust_statements_are_kept():
+    other = {"Sid": "SomethingElse", "Effect": "Allow", "Principal": {"AWS": OPERATOR}, "Action": "sts:AssumeRole"}
+    existing = _existing([OPERATOR, EXEC_ROLE])
+    existing["AssumeRolePolicyDocument"]["Statement"].insert(0, other)
+    iam = _iam(existing)
+    with _patch(iam):
+        tvm_trust.remove_trust("tvm", [OPERATOR])
+    doc = json.loads(iam.update_assume_role_policy.call_args.kwargs["PolicyDocument"])
+    assert other in doc["Statement"]
+    ours = [s for s in doc["Statement"] if s["Sid"] == tvm_trust.SID]
+    assert ours[0]["Condition"]["ArnEquals"]["aws:PrincipalArn"] == [EXEC_ROLE]
+
+
+def test_remove_refuses_untagged_role():
+    iam = _iam(_existing([OPERATOR, EXEC_ROLE], tags=[]))
+    with _patch(iam), pytest.raises(SystemExit):
+        tvm_trust.remove_trust("tvm", [OPERATOR])
+    iam.update_assume_role_policy.assert_not_called()

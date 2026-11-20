@@ -37,24 +37,23 @@ def resolve_principal(arn: str, iam) -> str:
     return arn
 
 
-def trust_policy(account_id: str, principals: list) -> dict:
-    return {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Sid": SID,
-                "Effect": "Allow",
-                "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
-                "Action": ["sts:AssumeRole", "sts:TagSession"],
-                "Condition": {
-                    "ArnEquals": {"aws:PrincipalArn": sorted(principals)},
-                    "Null": {"aws:RequestTag/TenantID": "false"},
-                    "ForAllValues:StringEquals": {"aws:TagKeys": ["TenantID"]},
-                    "StringNotLike": {"aws:RequestTag/TenantID": ["*:*", "*/*"]},
-                },
-            }
-        ],
+def trust_policy(account_id: str, principals: list, existing: dict = None) -> dict:
+    """Build the trust policy; statements other than ours in `existing` are kept."""
+    ours = {
+        "Sid": SID,
+        "Effect": "Allow",
+        "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+        "Action": ["sts:AssumeRole", "sts:TagSession"],
+        "Condition": {
+            "ArnEquals": {"aws:PrincipalArn": sorted(principals)},
+            "Null": {"aws:RequestTag/TenantID": "false"},
+            "ForAllValues:StringEquals": {"aws:TagKeys": ["TenantID"]},
+            "StringLike": {"aws:RequestTag/TenantID": "?*"},
+            "StringNotLike": {"aws:RequestTag/TenantID": ["*:*", "*/*"]},
+        },
     }
+    others = [s for s in (existing or {}).get("Statement", []) if s.get("Sid") != SID]
+    return {"Version": "2012-10-17", "Statement": others + [ours]}
 
 
 def current_principals(role: dict) -> list:
@@ -67,6 +66,15 @@ def current_principals(role: dict) -> list:
 
 def _clients():
     return boto3.client("iam"), boto3.client("sts").get_caller_identity()["Account"]
+
+
+def _require_owned(role: dict, role_name: str) -> None:
+    tags = {t["Key"]: t["Value"] for t in role.get("Tags", [])}
+    if tags.get(SAMPLE_TAG["Key"]) != SAMPLE_TAG["Value"]:
+        raise SystemExit(
+            f"ERROR: role {role_name} exists but was not created by this sample "
+            f"(no tag {SAMPLE_TAG['Key']}={SAMPLE_TAG['Value']}). Not changing it."
+        )
 
 
 def ensure_trust(role_name: str, principal_arns: list, description: str = "") -> str:
@@ -87,16 +95,13 @@ def ensure_trust(role_name: str, principal_arns: list, description: str = "") ->
         )
         return iam.get_role(RoleName=role_name)["Role"]["Arn"]
 
-    tags = {t["Key"]: t["Value"] for t in role.get("Tags", [])}
-    if tags.get(SAMPLE_TAG["Key"]) != SAMPLE_TAG["Value"]:
-        raise SystemExit(
-            f"ERROR: role {role_name} exists but was not created by this sample "
-            f"(no tag {SAMPLE_TAG['Key']}={SAMPLE_TAG['Value']}). Not changing it."
-        )
+    _require_owned(role, role_name)
     merged = wanted | set(current_principals(role))
     iam.update_assume_role_policy(
         RoleName=role_name,
-        PolicyDocument=json.dumps(trust_policy(account_id, list(merged))),
+        PolicyDocument=json.dumps(
+            trust_policy(account_id, list(merged), role.get("AssumeRolePolicyDocument"))
+        ),
     )
     return role["Arn"]
 
@@ -105,13 +110,16 @@ def remove_trust(role_name: str, principal_arns: list) -> list:
     """Remove principals from the trust policy. Returns the principals left."""
     iam, account_id = _clients()
     role = iam.get_role(RoleName=role_name)["Role"]
+    _require_owned(role, role_name)
     drop = {resolve_principal(a, iam) for a in principal_arns}
     left = [p for p in current_principals(role) if p not in drop]
     if not left:
         raise SystemExit("ERROR: that would leave no trusted principal; delete the role instead.")
     iam.update_assume_role_policy(
         RoleName=role_name,
-        PolicyDocument=json.dumps(trust_policy(account_id, left)),
+        PolicyDocument=json.dumps(
+            trust_policy(account_id, left, role.get("AssumeRolePolicyDocument"))
+        ),
     )
     return left
 

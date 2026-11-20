@@ -56,11 +56,11 @@ AgentCore Memory identifiers:
              not `namespace` — conditioning on `namespace` silently returns zero
              records.
 
-Start-up placeholder: the base SDK reads (and on first boot writes) its initial
-session when the Agent is constructed, before any tenant is known. That
-placeholder runs under TVM credentials tagged with the reserved
-BOOTSTRAP_TENANT_ID, so the container's own role needs no AgentCore Memory
-permissions at all.
+Start-up placeholder: the base SDK writes an initial session when the Agent is
+constructed, before any tenant is known. That placeholder runs under TVM
+credentials tagged with the reserved BOOTSTRAP_TENANT_ID, so the container's own
+role needs no AgentCore Memory permissions at all. It is never read back, so
+every start-up begins from the state the code builds.
 
 Legacy lookups: when a record is missing, the SDK also looks for it under a
 legacy actor id ("session_<id>" / "agent_<id>") that no tenant owns. This class
@@ -232,7 +232,8 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         if len(session_id) > _MAX_SESSION_ID_LENGTH:
             raise IsolationError(
                 f"session id would be {len(session_id)} characters; AgentCore allows "
-                f"{_MAX_SESSION_ID_LENGTH}. Use a shorter conversation_id."
+                f"{_MAX_SESSION_ID_LENGTH}. tenant id, agent name, user id and "
+                "conversation id share that limit."
             )
         return session_id
 
@@ -244,22 +245,25 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         While active, list_events calls for any actor other than the current one
         return no events without calling AWS. This skips the SDK's legacy
         "session_<id>" / "agent_<id>" lookups. It also records whether a lookup
-        for the current actor failed, so a read error is not mistaken for
-        "no stored record".
+        for the current actor failed or returned events, so a read error or an
+        unreadable record is not mistaken for "no stored record".
         """
         client   = self.memory_client
         original = client.list_events
-        status   = {"failed": False}
+        status   = {"failed": False, "returned": False}
 
         def list_events(*args, **kwargs):
             actor_id = kwargs.get("actor_id", args[1] if len(args) > 1 else None)
             if actor_id != self.config.actor_id:
                 return []
             try:
-                return original(*args, **kwargs)
+                events = original(*args, **kwargs)
             except Exception:
                 status["failed"] = True
                 raise
+            if events:
+                status["returned"] = True
+            return events
 
         client.list_events = list_events
         try:
@@ -267,21 +271,40 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         finally:
             client.list_events = original
 
+    def _is_placeholder(self, session_id: str) -> bool:
+        return session_id == self._placeholder_session
+
     def read_session(self, session_id: str, **kwargs):
+        # The start-up placeholder is never read back: each boot starts clean,
+        # whatever an earlier deploy stored there.
+        if self._is_placeholder(session_id):
+            return None
         with self._current_actor_only():
             return super().read_session(session_id, **kwargs)
 
     def read_agent(self, session_id: str, agent_id: str, **kwargs):
+        if self._is_placeholder(session_id):
+            return None
         with self._current_actor_only() as status:
             result = super().read_agent(session_id, agent_id, **kwargs)
         if result is None and status["failed"]:
             raise IsolationError("could not read the stored agent record; not resetting it.")
+        if result is None and status["returned"]:
+            raise IsolationError("the stored agent record could not be parsed; not overwriting it.")
         return result
 
+    def _read_messages(self, session_id: str, agent_id: str, offset: int) -> list:
+        """list_messages, but a read error raises instead of returning []."""
+        with self._current_actor_only() as status:
+            messages = self.list_messages(session_id, agent_id, offset=offset)
+        if status["failed"]:
+            raise IsolationError("could not read the conversation history.")
+        return messages
+
     def initialize(self, agent, **kwargs) -> None:
-        """Run the base start-up, then keep a clean copy of the agent's state."""
-        super().initialize(agent, **kwargs)
+        """Keep a clean copy of the agent's state as built by the code, then run the base start-up."""
         self._clean_agent[agent.agent_id] = copy.deepcopy(SessionAgent.from_agent(agent))
+        super().initialize(agent, **kwargs)
 
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
         """Register all AgentCore hooks plus the per-request tenant injection hook."""
@@ -368,7 +391,7 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
 
     def _switch_to(self, agent, session_id: str) -> None:
         prepend  = self._restore_agent_state(agent, session_id)
-        restored = self.list_messages(
+        restored = self._read_messages(
             session_id, agent.agent_id,
             offset=agent.conversation_manager.removed_message_count,
         )

@@ -398,3 +398,63 @@ class TestClientConfig:
         mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
         for call in scoped.client.call_args_list:
             assert call.kwargs["config"] is mgr._client_config
+
+
+def _base_list_messages(mgr_self, session_id, agent_id, limit=None, offset=0, **kwargs):
+    """Mimic the SDK: list events for the current actor and swallow errors."""
+    try:
+        return mgr_self.memory_client.list_events(
+            memory_id="m", actor_id=mgr_self.config.actor_id, session_id=session_id,
+        )
+    except Exception:
+        return []
+
+
+class TestRound3:
+    def test_history_read_error_fails_the_switch_and_unbinds(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+        mgr, agent = _make_ready_manager()
+        mgr.memory_client.list_events = MagicMock(side_effect=RuntimeError("throttled"))
+        with patch.object(sm.AgentCoreMemorySessionManager, "list_messages", _base_list_messages):
+            with pytest.raises(IsolationError, match="history"):
+                mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        assert agent.messages == []
+        assert mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-")
+
+    def test_unparseable_stored_record_is_not_overwritten(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+
+        def read_agent_that_cannot_parse(mgr_self, session_id, agent_id, **kwargs):
+            mgr_self.memory_client.list_events(
+                memory_id="m", actor_id=mgr_self.config.actor_id, session_id=session_id,
+            )
+            return None  # the SDK swallows the parse error
+
+        mgr, agent = _make_ready_manager()
+        mgr.config.actor_id = "tenant-001:assistant:u"
+        mgr.memory_client.list_events = MagicMock(return_value=[{"payload": [{"blob": "not json"}]}])
+        with patch.object(sm.AgentCoreMemorySessionManager, "read_agent", read_agent_that_cannot_parse):
+            with pytest.raises(IsolationError, match="parsed"):
+                mgr.read_agent("s", agent.agent_id)
+
+    def test_placeholder_records_are_never_read(self):
+        mgr = _make_manager()
+        mgr.memory_client.list_events = MagicMock()
+        assert mgr.read_session(mgr._placeholder_session) is None
+        assert mgr.read_agent(mgr._placeholder_session, "agent-1") is None
+        mgr.memory_client.list_events.assert_not_called()
+
+    def test_clean_snapshot_is_taken_before_the_base_restore(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+
+        def base_initialize_that_restores_old_state(mgr_self, agent, **kwargs):
+            agent.state = AgentState({"v": 1})  # what an older deploy stored
+
+        mgr = _make_manager()
+        mgr._tvm.get_session.return_value = MagicMock()
+        agent = _make_agent()
+        agent.state = AgentState({"v": 2})  # what the code builds now
+        with patch.object(sm.AgentCoreMemorySessionManager, "initialize", base_initialize_that_restores_old_state):
+            mgr.initialize(agent)
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-new")
+        assert agent.state.get("v") == 2

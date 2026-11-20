@@ -123,7 +123,17 @@ client = boto3.client("bedrock-agentcore-control", region_name=region)
 # sample=multi-tenant-agentcore-memory) and it already has BOTH long-term
 # strategies (USER_PREFERENCE + SEMANTIC). Reusing a memory created without them
 # would silently disable long-term recall with no clear error.
-for m in client.list_memories().get("memories", []):
+def _all_memories():
+    token = None
+    while True:
+        page = client.list_memories(**({"nextToken": token} if token else {}))
+        yield from page.get("memories", [])
+        token = page.get("nextToken")
+        if not token:
+            return
+
+
+for m in _all_memories():
     memory_id = m.get("id", "")
     if not memory_id.startswith(f"{name}-"):
         continue
