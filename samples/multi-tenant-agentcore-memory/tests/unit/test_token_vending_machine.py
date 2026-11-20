@@ -8,6 +8,7 @@ No real AWS calls are made.
 """
 
 import os
+import time
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -140,18 +141,22 @@ class TestTVMNegativeCache:
 
     def test_sts_failure_is_retried_after_back_off(self):
         with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
-             patch("agentcore_memory.token_vending_machine.boto3.Session"), \
-             patch("agentcore_memory.token_vending_machine.time.monotonic") as clock:
+             patch("agentcore_memory.token_vending_machine.boto3.Session"):
             tvm, mock_sts = self._failing_tvm(mock_boto_client)
-            clock.return_value = 1000.0
             with pytest.raises(IsolationError):
                 tvm.get_session({"tenantId": "tenant-001"})
-            # Back-off is seconds, not the 12-minute credential TTL.
-            clock.return_value = 1006.0
+            # Back-off is seconds, not the 12-minute credential TTL: expire it.
+            tvm._recent_failures.expire(time.monotonic() + 6)
             mock_sts.assume_role.side_effect = None
             mock_sts.assume_role.return_value = {"Credentials": STS_CREDENTIALS}
             tvm.get_session({"tenantId": "tenant-001"})
             assert mock_sts.assume_role.call_count == 2
+
+    def test_failure_back_off_is_bounded(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client"):
+            tvm = TokenVendingMachine(role_arn=VALID_ARN)
+            assert tvm._recent_failures.ttl <= 10
+            assert tvm._recent_failures.maxsize <= 1024
 
 
 class TestTenantIdValidation:
@@ -163,7 +168,7 @@ class TestTenantIdValidation:
         "acme:corp",   # ':' is the actorId separator
         "acme/x",      # '/' is the namespace separator
         "-leading",
-        "_bootstrap",  # reserved for the start-up placeholder
+        "agentcore-bootstrap",  # reserved for the start-up placeholder
         "a" * 58,      # RoleSessionName limit
         "tenant 1",
         123,
@@ -195,3 +200,24 @@ class TestBootstrapSession:
                 Tags=[{"Key": "TenantID", "Value": BOOTSTRAP_TENANT_ID}],
                 DurationSeconds=900,
             )
+
+    def test_bootstrap_session_retries_then_succeeds(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
+             patch("agentcore_memory.token_vending_machine.boto3.Session"), \
+             patch("agentcore_memory.token_vending_machine.time.sleep") as sleep:
+            mock_sts = MagicMock()
+            mock_sts.assume_role.side_effect = [RuntimeError("propagating"), {"Credentials": STS_CREDENTIALS}]
+            mock_boto_client.return_value = mock_sts
+            TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session()
+            assert mock_sts.assume_role.call_count == 2
+            sleep.assert_called_once()
+
+    def test_bootstrap_session_gives_up_after_attempts(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
+             patch("agentcore_memory.token_vending_machine.time.sleep"):
+            mock_sts = MagicMock()
+            mock_sts.assume_role.side_effect = RuntimeError("denied")
+            mock_boto_client.return_value = mock_sts
+            with pytest.raises(IsolationError):
+                TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session(attempts=3)
+            assert mock_sts.assume_role.call_count == 3

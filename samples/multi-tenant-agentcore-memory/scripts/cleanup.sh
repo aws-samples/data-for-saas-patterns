@@ -12,7 +12,7 @@
 #
 # The AgentCore Runtime is removed with the starter toolkit's destroy operation,
 # which also removes what the toolkit created on deploy: the runtime execution
-# role, the CodeBuild project and role, the ECR repository and S3 artifacts.
+# role (with its inline policies) and the S3 code artifacts.
 # That needs .bedrock_agentcore.yaml from the last deploy; without it the
 # runtime is deleted by name and the toolkit resources are listed for you to
 # check by hand.
@@ -57,7 +57,6 @@ result = destroy_bedrock_agentcore(
     config_path=Path(os.environ["REPO_ROOT"]) / ".bedrock_agentcore.yaml",
     agent_name=os.environ["AGENT_NAME"],
     force=True,
-    delete_ecr_repo=True,
 )
 for item in result.resources_removed:
     print(f"  Removed: {item}")
@@ -80,11 +79,9 @@ else
     echo "  None found."
   fi
   echo "  No .bedrock_agentcore.yaml found, so the toolkit's deploy resources were"
-  echo "  not removed. Check for and delete by hand if present: the IAM roles"
-  echo "  'AmazonBedrockAgentCoreSDKRuntime-${REGION}-*' and"
-  echo "  'AmazonBedrockAgentCoreSDKCodeBuild-${REGION}-*', the CodeBuild project"
-  echo "  and ECR repository named after '${AGENT_NAME}', and the toolkit's S3"
-  echo "  source bucket."
+  echo "  not removed. Check for and delete by hand if present: the IAM role"
+  echo "  'AmazonBedrockAgentCoreSDKRuntime-${REGION}-*' and the code zip the"
+  echo "  toolkit uploaded to its S3 bucket for '${AGENT_NAME}'."
 fi
 
 # ---------------------------------------------------------------------------

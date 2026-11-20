@@ -56,22 +56,31 @@ AgentCore Memory identifiers:
              not `namespace` — conditioning on `namespace` silently returns zero
              records.
 
-Start-up placeholder: the base SDK reads and writes its initial session when the
-Agent is constructed, before any tenant is known. That placeholder runs under TVM
-credentials tagged with the reserved BOOTSTRAP_TENANT_ID, so the container's own
-role needs no AgentCore Memory permissions at all.
+Start-up placeholder: the base SDK reads (and on first boot writes) its initial
+session when the Agent is constructed, before any tenant is known. That
+placeholder runs under TVM credentials tagged with the reserved
+BOOTSTRAP_TENANT_ID, so the container's own role needs no AgentCore Memory
+permissions at all.
+
+Legacy lookups: when a record is missing, the SDK also looks for it under a
+legacy actor id ("session_<id>" / "agent_<id>") that no tenant owns. This class
+skips those lookups: IAM would deny them, and they would read outside the tenant.
 
 Required invocation_state keys per request:
     tenant_context  (dict)  — must contain 'tenantId'
     user_id         (str)
     conversation_id (str)
+Calls that fire the hook without them (for example Agent.structured_output) are
+refused with IsolationError.
 
 Env vars: AGENTCORE_MEMORY_ID, AGENTCORE_TVM_ROLE_ARN, AWS_REGION
 """
 
+import contextlib
 import copy
 import logging
 import os
+import re
 from typing import Dict, Optional
 
 from strands.agent.state import AgentState
@@ -97,6 +106,10 @@ logger = logging.getLogger(__name__)
 # across process restarts so stored memories stay retrievable.
 AGENT_NAME = "assistant"
 
+# user_id and conversation_id must fit the AgentCore sessionId character set.
+_ID_PART_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_MAX_SESSION_ID_LENGTH = 100   # AgentCore Memory sessionId limit
+
 # Long-term memory namespace templates. The base session manager resolves
 # {actorId} to the current tenant-scoped actor_id at retrieval time, so each
 # resolved path (e.g. /tenant-001:assistant:user-456/preferences) always starts
@@ -107,6 +120,14 @@ AGENT_NAME = "assistant"
 # .../preferences and a SEMANTIC strategy writes to .../facts.
 MEMORY_NAMESPACE_PREFERENCES = "/{actorId}/preferences"
 MEMORY_NAMESPACE_FACTS       = "/{actorId}/facts"
+
+
+def _validate_id_part(name: str, value) -> str:
+    if not isinstance(value, str) or not _ID_PART_PATTERN.match(value):
+        raise IsolationError(
+            f"{name} must match ^[A-Za-z0-9][A-Za-z0-9_-]{{0,127}}$."
+        )
+    return value
 
 
 class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
@@ -171,10 +192,12 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         # Placeholder config — actor_id/session_id are overwritten per request in
         # _prepare(). The placeholder lives under the reserved bootstrap tenant
         # and runs under bootstrap TVM credentials, never the container's own.
+        self._placeholder_actor   = f"{BOOTSTRAP_TENANT_ID}:{agent_name}:init"
+        self._placeholder_session = f"{BOOTSTRAP_TENANT_ID}-{agent_name}-init"
         placeholder = AgentCoreMemoryConfig(
             memory_id=memory_id,
-            actor_id=f"{BOOTSTRAP_TENANT_ID}:{agent_name}:init",
-            session_id=f"{BOOTSTRAP_TENANT_ID}-{agent_name}-init",
+            actor_id=self._placeholder_actor,
+            session_id=self._placeholder_session,
             retrieval_config=self._retrieval_config,
         )
         super().__init__(
@@ -183,20 +206,77 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
             boto_session=self._tvm.get_bootstrap_session(),
             **kwargs,
         )
+        # Reuse the base client config (user agent, retries) on every client swap.
+        self._client_config = getattr(
+            getattr(self.memory_client.gmdp_client, "meta", None), "config", None
+        )
         logger.debug(
             "[memory] session manager init: memory_id=%s region=%s agent=%s",
             memory_id, self.region_name, agent_name,
         )
 
+    # -- identifiers ---------------------------------------------------------
+
     def _build_actor_id(self, tenant_context: Dict, user_id: str) -> str:
         """Return '{tenantId}:{agentName}:{userId}' — scopes all memory ops to tenant+agent+user."""
         tenant_id = validate_tenant_id(tenant_context)
+        _validate_id_part("user_id", user_id)
         return f"{tenant_id}:{self.agent_name}:{user_id}"
 
     def _build_session_id(self, tenant_context: Dict, user_id: str, conversation_id: str) -> str:
         """Return '{tenantId}-{agentName}-{userId}-{conversationId}' — scopes memory to one conversation."""
         tenant_id = validate_tenant_id(tenant_context)
-        return f"{tenant_id}-{self.agent_name}-{user_id}-{conversation_id}"
+        _validate_id_part("user_id", user_id)
+        _validate_id_part("conversation_id", conversation_id)
+        session_id = f"{tenant_id}-{self.agent_name}-{user_id}-{conversation_id}"
+        if len(session_id) > _MAX_SESSION_ID_LENGTH:
+            raise IsolationError(
+                f"session id would be {len(session_id)} characters; AgentCore allows "
+                f"{_MAX_SESSION_ID_LENGTH}. Use a shorter conversation_id."
+            )
+        return session_id
+
+    # -- SDK overrides -------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _current_actor_only(self):
+        """
+        While active, list_events calls for any actor other than the current one
+        return no events without calling AWS. This skips the SDK's legacy
+        "session_<id>" / "agent_<id>" lookups. It also records whether a lookup
+        for the current actor failed, so a read error is not mistaken for
+        "no stored record".
+        """
+        client   = self.memory_client
+        original = client.list_events
+        status   = {"failed": False}
+
+        def list_events(*args, **kwargs):
+            actor_id = kwargs.get("actor_id", args[1] if len(args) > 1 else None)
+            if actor_id != self.config.actor_id:
+                return []
+            try:
+                return original(*args, **kwargs)
+            except Exception:
+                status["failed"] = True
+                raise
+
+        client.list_events = list_events
+        try:
+            yield status
+        finally:
+            client.list_events = original
+
+    def read_session(self, session_id: str, **kwargs):
+        with self._current_actor_only():
+            return super().read_session(session_id, **kwargs)
+
+    def read_agent(self, session_id: str, agent_id: str, **kwargs):
+        with self._current_actor_only() as status:
+            result = super().read_agent(session_id, agent_id, **kwargs)
+        if result is None and status["failed"]:
+            raise IsolationError("could not read the stored agent record; not resetting it.")
+        return result
 
     def initialize(self, agent, **kwargs) -> None:
         """Run the base start-up, then keep a clean copy of the agent's state."""
@@ -206,15 +286,19 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
         """Register all AgentCore hooks plus the per-request tenant injection hook."""
         super().register_hooks(registry, **kwargs)
-        registry.add_callback(
-            BeforeInvocationEvent,
-            lambda event: self._prepare(
-                event.agent,
-                event.invocation_state["tenant_context"],
-                event.invocation_state["user_id"],
-                event.invocation_state["conversation_id"],
-            ),
-        )
+        registry.add_callback(BeforeInvocationEvent, self._on_before_invocation)
+
+    # -- per-request binding -------------------------------------------------
+
+    def _on_before_invocation(self, event) -> None:
+        state = event.invocation_state or {}
+        missing = [k for k in ("tenant_context", "user_id", "conversation_id") if k not in state]
+        if missing:
+            raise IsolationError(
+                f"invocation_state is missing {', '.join(missing)}; every call must "
+                "carry the tenant identity (structured_output is not supported)."
+            )
+        self._prepare(event.agent, state["tenant_context"], state["user_id"], state["conversation_id"])
 
     def _prepare(self, agent, tenant_context: Dict, user_id: str, conversation_id: str) -> None:
         """
@@ -224,33 +308,35 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         under TVM credentials (IAM ABAC).
 
         (a) Get TVM-scoped credentials for this tenant (STS AssumeRole + TenantID tag).
-        (b) Build tenant-scoped actor_id/session_id and detect whether the
-            conversation changed since the last request on this singleton.
+        (b) Build tenant-scoped actor_id/session_id and detect whether the actor
+            or conversation changed since the last request on this singleton.
         (c) Bind config.actor_id, config.session_id, and self.session_id (the
             RepositorySessionManager base field used by append_message/create_agent).
         (d) Set config.retrieval_config so long-term memory is semantically
             retrieved every turn and injected as a <user_context> block.
         (e) Swap the boto3 clients on the singleton to the scoped credentials.
-        (f) On session change, replace everything the agent carries from the
-            previous session: agent.state, conversation-manager state, internal
-            state and agent.messages. Stored state for the new session is read
-            back from AgentCore Memory; a session with none gets the clean
-            start-up state. This is also what makes recall survive a fresh
-            microVM: on AgentCore Runtime the Agent is a module-level singleton
-            and a "known" session can land on a fresh microVM (idle/8h
-            termination) with an empty agent.messages. Assigning agent.messages
-            directly does not re-emit MessageAddedEvent, so restored history is
-            not re-persisted.
+        (f) On a switch, replace everything the agent carries from the previous
+            session: agent.state, conversation-manager state, internal state and
+            agent.messages. Stored state for the new session is read back from
+            AgentCore Memory; a session with none gets the clean start-up state.
+            If that fails, the agent is cleared and unbound before the error is
+            raised, so no later request can run on the previous transcript.
+            This is also what makes recall survive a fresh microVM: on
+            AgentCore Runtime the Agent is a module-level singleton and a
+            "known" session can land on a fresh microVM (idle/8h termination)
+            with an empty agent.messages. Assigning agent.messages directly does
+            not re-emit MessageAddedEvent, so restored history is not re-persisted.
 
-        Raises IsolationError if tenantId is missing or invalid, or STS AssumeRole fails.
+        Raises IsolationError if an identifier is missing or invalid, STS
+        AssumeRole fails, or the stored record cannot be read.
         """
         # (a) TVM-scoped credentials for this tenant (validates the tenant id)
         scoped_session = self._tvm.get_session(tenant_context)
 
-        # (b) tenant-scoped identifiers; detect whether the conversation changed
+        # (b) tenant-scoped identifiers; detect a switch on actor OR session
         actor_id   = self._build_actor_id(tenant_context, user_id)
         session_id = self._build_session_id(tenant_context, user_id, conversation_id)
-        switching  = session_id != self.config.session_id
+        switching  = (actor_id, session_id) != (self.config.actor_id, self.config.session_id)
 
         # (c) bind the singleton to this request
         self.config.actor_id   = actor_id
@@ -261,33 +347,42 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         self.config.retrieval_config = self._retrieval_config
 
         # (e) swap clients to scoped credentials BEFORE any read
-        self.memory_client.gmcp_client = scoped_session.client(
-            "bedrock-agentcore-control", region_name=self.region_name
-        )
-        self.memory_client.gmdp_client = scoped_session.client(
-            "bedrock-agentcore", region_name=self.region_name
-        )
+        client_kwargs = {"region_name": self.region_name}
+        if self._client_config is not None:
+            client_kwargs["config"] = self._client_config
+        self.memory_client.gmcp_client = scoped_session.client("bedrock-agentcore-control", **client_kwargs)
+        self.memory_client.gmdp_client = scoped_session.client("bedrock-agentcore", **client_kwargs)
 
         logger.debug(
             "[memory] _prepare: tenant=%s actor_id=%s session_id=%s switching=%s",
             tenant_context.get("tenantId"), actor_id, session_id, switching,
         )
 
-        # (f) on session change, drop the previous session's state and restore
-        #     this session's (STM transcript plus agent state) from AgentCore Memory.
+        # (f) on a switch, drop the previous session's state and restore this one's
         if switching:
-            prepend  = self._restore_agent_state(agent, session_id)
-            restored = self.list_messages(
-                session_id, agent.agent_id,
-                offset=agent.conversation_manager.removed_message_count,
-            )
-            agent.messages = prepend + [m.to_message() for m in restored]
-            self._latest_agent_message[agent.agent_id] = restored[-1] if restored else None
-            self._held_records[agent.agent_id] = list(restored)
-            logger.debug(
-                "[memory] _prepare: rehydrated %d message(s) for session=%s",
-                len(restored), session_id,
-            )
+            try:
+                self._switch_to(agent, session_id)
+            except Exception:
+                self._unbind(agent)
+                raise
+
+    def _switch_to(self, agent, session_id: str) -> None:
+        prepend  = self._restore_agent_state(agent, session_id)
+        restored = self.list_messages(
+            session_id, agent.agent_id,
+            offset=agent.conversation_manager.removed_message_count,
+        )
+        if getattr(agent.model, "stateful", False):
+            # Server-managed conversation: nothing to restore locally.
+            agent.messages = []
+        else:
+            agent.messages = self._fix_broken_tool_use(prepend + [m.to_message() for m in restored])
+        self._latest_agent_message[agent.agent_id] = restored[-1] if restored else None
+        self._held_records[agent.agent_id] = list(restored)
+        logger.debug(
+            "[memory] _prepare: rehydrated %d message(s) for session=%s",
+            len(restored), session_id,
+        )
 
     def _restore_agent_state(self, agent, session_id: str) -> list:
         """
@@ -295,19 +390,44 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
 
         Returns any messages the conversation manager asks to prepend (for
         example a stored summary).
-
-        For a session with no stored state the SDK also tries a legacy actor id
-        ("agent_<id>") that IAM denies by design; the SDK logs that as
-        "Failed to read agent" and carries on.
         """
         stored: Optional[SessionAgent] = self.read_agent(session_id, agent.agent_id)
         source = stored or self._clean_agent.get(agent.agent_id)
         if source is None:
             raise IsolationError("agent was not initialised by this session manager.")
-        source = copy.deepcopy(source)
-        agent.state = AgentState(source.state)
-        source.initialize_internal_state(agent)
-        prepend = agent.conversation_manager.restore_from_session(source.conversation_manager_state)
+        self._apply(agent, source)
+        prepend = agent.conversation_manager.restore_from_session(
+            copy.deepcopy(source.conversation_manager_state)
+        )
+        if stored is None:
+            # New session: record the agent with its own created_at, as the base
+            # initialize() does, instead of inheriting the previous session's.
+            self.create_agent(session_id, SessionAgent.from_agent(agent))
         # Force the next sync to write this session's state under its own actor.
         self._last_synced_internal_state.pop(agent.agent_id, None)
         return prepend or []
+
+    @staticmethod
+    def _apply(agent, source: SessionAgent) -> None:
+        source = copy.deepcopy(source)
+        agent.state = AgentState(source.state)
+        source.initialize_internal_state(agent)
+
+    def _unbind(self, agent) -> None:
+        """After a failed switch: drop everything and bind to the placeholder ids."""
+        agent.messages = []
+        clean = self._clean_agent.get(agent.agent_id)
+        if clean is not None:
+            self._apply(agent, clean)
+            try:
+                agent.conversation_manager.restore_from_session(
+                    copy.deepcopy(clean.conversation_manager_state)
+                )
+            except Exception:  # best effort; the agent is unbound either way
+                logger.warning("[memory] could not reset conversation manager after a failed switch")
+        self.config.actor_id   = self._placeholder_actor
+        self.config.session_id = self._placeholder_session
+        self.session_id        = self._placeholder_session
+        self._latest_agent_message[agent.agent_id] = None
+        self._held_records[agent.agent_id] = []
+        self._last_synced_internal_state.pop(agent.agent_id, None)

@@ -38,8 +38,7 @@ Deploy:
   See README.md — "Run the examples → Deploy to AgentCore Runtime"
 """
 
-import base64
-import json
+import hashlib
 import logging
 import os
 import sys
@@ -52,7 +51,8 @@ from bedrock_agentcore.runtime import BedrockAgentCoreApp
 from strands import Agent
 from strands.models import BedrockModel
 
-from agentcore_memory import MultiTenantAgentCoreMemorySessionManager
+from agentcore_memory import IsolationError, MultiTenantAgentCoreMemorySessionManager
+from agentcore_memory.identity import extract_identity
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -89,52 +89,27 @@ def health_check():
     return PingStatus.HEALTHY
 
 
-def _decode_jwt_payload(token: str) -> dict:
-    """Decode JWT payload — signature already verified by AgentCore Runtime."""
-    try:
-        part = token.split(".")[1]
-        part += "=" * (-len(part) % 4)
-        return json.loads(base64.urlsafe_b64decode(part))
-    except Exception:
-        return {}
-
-
-def _extract_identity(context) -> dict | None:
+def _conversation_from_session(runtime_session_id) -> str:
     """
-    Extract tenant identity from the AgentCore request context.
-
-    Returns a dict with tenant_context + user_id, or None if the JWT is missing
-    or the tenant_id or sub claim is absent. user_id is always taken from the
-    JWT `sub` claim — never overridable by the request payload. The tenant id
-    format is validated by the session manager.
+    Default conversation id when the payload has none: a short digest of the
+    runtime session id (33-64 characters), so the memory session id stays
+    within the AgentCore limit of 100 characters.
     """
-    headers     = context.request_headers or {}
-    auth_header = headers.get("Authorization") or headers.get("authorization") or ""
-    claims      = _decode_jwt_payload(auth_header.removeprefix("Bearer "))
-    tenant_id   = claims.get("custom:tenant_id", "")
-    user_id     = claims.get("sub", "")
-    if not tenant_id or not user_id:
-        return None
-    return {
-        "tenant_context": {
-            "tenantId":   tenant_id,
-            "tenantName": claims.get("custom:tenant_name", ""),
-            "tier":       claims.get("custom:tier", "standard"),
-        },
-        "user_id": user_id,
-    }
+    if not runtime_session_id:
+        return "default"
+    return "rs-" + hashlib.sha256(runtime_session_id.encode()).hexdigest()[:16]
 
 
 @app.entrypoint
 def invoke(payload: dict, context) -> dict:
     """Called by AgentCore Runtime for every /invocations request."""
     try:
-        identity = _extract_identity(context)
+        identity = extract_identity(context.request_headers)
         if not identity:
             return {"error": "JWT missing custom:tenant_id or sub claim"}
 
         tenant_id       = identity["tenant_context"]["tenantId"]
-        conversation_id = payload.get("conversation_id") or context.session_id or "default"
+        conversation_id = payload.get("conversation_id") or _conversation_from_session(context.session_id)
         message         = payload.get("message", "")
 
         response = _agent(
@@ -158,6 +133,10 @@ def invoke(payload: dict, context) -> dict:
             "tenant_id":       tenant_id,
             "conversation_id": conversation_id,
         }
+    except IsolationError as e:
+        # Bad identifiers (tenant, user or conversation id) or a TVM failure.
+        logger.warning("invoke rejected: %s", e)
+        return {"error": "request rejected: invalid tenant, user or conversation id, or credentials unavailable"}
     except Exception as e:
         # Full details go to server-side logs only. Exception messages can
         # contain internal identifiers (role ARNs, tenant ids, etc. — see

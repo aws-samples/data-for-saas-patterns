@@ -57,6 +57,7 @@ def _make_agent(agent_id="agent-1"):
     agent.state = AgentState()
     agent.conversation_manager = _ConversationManager()
     agent._model_state = {}
+    agent.model.stateful = False
     return agent
 
 
@@ -125,7 +126,7 @@ class TestBuildActorId:
         with pytest.raises(IsolationError, match="tenantId"):
             mgr._build_actor_id({}, "user-456")
 
-    @pytest.mark.parametrize("bad", ["acme:corp", "acme/x", "_bootstrap", "a" * 58, "", None])
+    @pytest.mark.parametrize("bad", ["acme:corp", "acme/x", "_x", "agentcore-bootstrap", "a" * 58, "", None])
     def test_invalid_tenant_id_raises(self, bad):
         mgr = _make_manager()
         with pytest.raises(IsolationError):
@@ -142,6 +143,17 @@ class TestBuildSessionId:
         mgr = _make_manager()
         with pytest.raises(IsolationError, match="tenantId"):
             mgr._build_session_id({}, "user-456", "conv-001")
+
+    @pytest.mark.parametrize("bad", ["conv:1", "conv/1", "conv 1", "-conv", "", None])
+    def test_invalid_conversation_id_raises(self, bad):
+        mgr = _make_manager()
+        with pytest.raises(IsolationError, match="conversation_id"):
+            mgr._build_session_id(TENANT_1, "user-456", bad)
+
+    def test_session_id_over_100_characters_raises(self):
+        mgr = _make_manager()
+        with pytest.raises(IsolationError, match="100"):
+            mgr._build_session_id(TENANT_1, "u" * 40, "c" * 60)
 
 
 class TestPrepare:
@@ -258,3 +270,131 @@ class TestStateOnTenantSwitch:
         mgr._tvm.get_session.return_value = MagicMock()
         with pytest.raises(IsolationError):
             mgr._prepare(_make_agent(), TENANT_1, "user-1", "conv-1")
+
+    def test_new_session_records_agent_with_its_own_created_at(self):
+        mgr, agent = _make_ready_manager()
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        session_id, record = mgr.created_agents[-1]
+        assert session_id == f"tenant-001-{AGENT_NAME}-user-1-conv-1"
+        assert record.agent_id == agent.agent_id
+
+    def test_stored_session_is_not_recorded_again(self):
+        mgr, agent = _make_ready_manager()
+        mgr.read_agent = MagicMock(return_value=SessionAgent(
+            agent.agent_id, {}, {"__name__": "_ConversationManager", "removed_message_count": 0},
+            {"model_state": {}},
+        ))
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        assert not getattr(mgr, "created_agents", [])
+
+    def test_switch_detected_on_actor_change_with_same_session_id(self):
+        """Different actors whose session ids collide still trigger a reset."""
+        mgr, agent = _make_ready_manager()
+        mgr._prepare(agent, {"tenantId": "t"}, "assistant-x", "c1")
+        first_session = mgr.config.session_id
+        agent.state.set("secret", "t data")
+        mgr._prepare(agent, {"tenantId": "t-assistant"}, "x", "c1")
+        assert mgr.config.session_id == first_session
+        assert agent.state.get("secret") is None
+
+    def test_stateful_model_gets_no_local_transcript(self):
+        mgr, agent = _make_ready_manager()
+        agent.model.stateful = True
+        agent.messages = [{"role": "user", "content": [{"text": "old"}]}]
+        msg = MagicMock()
+        msg.to_message.return_value = {"role": "user", "content": [{"text": "hi"}]}
+        mgr.list_messages = MagicMock(return_value=[msg])
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        assert agent.messages == []
+
+
+class TestFailedSwitch:
+    def test_failed_restore_clears_and_unbinds(self):
+        mgr, agent = _make_ready_manager()
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        agent.messages = [{"role": "user", "content": [{"text": "tenant-001 secret"}]}]
+        agent.state.set("secret", "tenant-001 data")
+
+        mgr.read_agent = MagicMock(side_effect=IsolationError("read failed"))
+        with pytest.raises(IsolationError):
+            mgr._prepare(agent, TENANT_2, "user-1", "conv-1")
+
+        assert agent.messages == []
+        assert agent.state.get("secret") is None
+        assert mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-")
+        assert mgr.config.actor_id.startswith(f"{BOOTSTRAP_TENANT_ID}:")
+
+        # The next request for tenant-002 is a switch again, not a reuse.
+        mgr.read_agent = MagicMock(return_value=None)
+        mgr.list_messages = MagicMock(return_value=[])
+        mgr._prepare(agent, TENANT_2, "user-1", "conv-1")
+        mgr.list_messages.assert_called_once()
+
+
+def _base_read_agent(mgr_self, session_id, agent_id, **kwargs):
+    """Mimic the SDK: query the current actor, then a legacy actor; swallow errors."""
+    try:
+        events = mgr_self.memory_client.list_events(
+            memory_id="m", actor_id=mgr_self.config.actor_id, session_id=session_id,
+        )
+        if events:
+            return events[0]
+        mgr_self.memory_client.list_events(
+            memory_id="m", actor_id=f"agent_{agent_id}", session_id=session_id,
+        )
+        return None
+    except Exception:
+        return None
+
+
+class TestStoredRecordReads:
+    def test_legacy_actor_lookups_are_skipped(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+        mgr, agent = _make_ready_manager()
+        mgr.config.actor_id = "tenant-001:assistant:u"
+        mgr.memory_client.list_events = MagicMock(return_value=[])
+        original = mgr.memory_client.list_events
+        with patch.object(sm.AgentCoreMemorySessionManager, "read_agent", _base_read_agent):
+            assert mgr.read_agent("s", agent.agent_id) is None
+        actors = [c.kwargs["actor_id"] for c in original.call_args_list]
+        assert actors == ["tenant-001:assistant:u"]
+        assert mgr.memory_client.list_events is original
+
+    def test_read_error_is_not_treated_as_missing_record(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+        mgr, agent = _make_ready_manager()
+        mgr.config.actor_id = "tenant-001:assistant:u"
+        mgr.memory_client.list_events = MagicMock(side_effect=RuntimeError("throttled"))
+        with patch.object(sm.AgentCoreMemorySessionManager, "read_agent", _base_read_agent):
+            with pytest.raises(IsolationError, match="not resetting"):
+                mgr.read_agent("s", agent.agent_id)
+
+
+class TestHook:
+    def _event(self, state):
+        event = MagicMock()
+        event.invocation_state = state
+        return event
+
+    def test_missing_invocation_state_keys_raise_isolation_error(self):
+        mgr, _ = _make_ready_manager()
+        with pytest.raises(IsolationError, match="tenant_context"):
+            mgr._on_before_invocation(self._event({}))
+
+    def test_hook_calls_prepare_with_state(self):
+        mgr, agent = _make_ready_manager()
+        mgr._prepare = MagicMock()
+        event = self._event({"tenant_context": TENANT_1, "user_id": "u", "conversation_id": "c"})
+        event.agent = agent
+        mgr._on_before_invocation(event)
+        mgr._prepare.assert_called_once_with(agent, TENANT_1, "u", "c")
+
+
+class TestClientConfig:
+    def test_swapped_clients_reuse_base_client_config(self):
+        mgr, agent = _make_ready_manager()
+        scoped = MagicMock()
+        mgr._tvm.get_session.return_value = scoped
+        mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        for call in scoped.client.call_args_list:
+            assert call.kwargs["config"] is mgr._client_config

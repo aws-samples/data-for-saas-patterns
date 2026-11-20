@@ -2,7 +2,8 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 #
-# setup_agentcore.sh -- Deploys the multi-tenant agent example to AgentCore Runtime.
+# setup_agentcore.sh -- Deploys the multi-tenant agent example to AgentCore Runtime
+# with the starter toolkit's direct code deploy (a code zip in S3).
 #
 # Usage: bash setup_agentcore.sh
 #
@@ -89,14 +90,14 @@ configure_bedrock_agentcore(
     request_header_configuration={"requestHeaderAllowlist": ["Authorization"]},
     region=REGION,
     non_interactive=True,
+    deployment_type="direct_code_deploy",   # code zip in S3, no container build
     runtime_type="PYTHON_3_13",
 )
 
-print(f"Launching {AGENT_NAME} (CodeBuild) ...")
+print(f"Launching {AGENT_NAME} (direct code deploy) ...")
 result = launch_bedrock_agentcore(
     config_path=REPO_ROOT / ".bedrock_agentcore.yaml",
     agent_name=AGENT_NAME,
-    use_codebuild=True,
     auto_update_on_conflict=True,
     env_vars={
         "AGENTCORE_MEMORY_ID": MEMORY_ID,
@@ -109,37 +110,30 @@ result = launch_bedrock_agentcore(
 print(f"Deployed: agent_id={result.agent_id}")
 print(f"  export AGENT_ARN={result.agent_arn}")
 
-# Execution role permissions: invoke the configured model and assume the TVM
-# role. The execution role gets NO AgentCore Memory permissions: every memory
-# call, including the start-up placeholder, is signed with TVM credentials.
+# Execution role: the toolkit creates it with Bedrock model invoke, logs and
+# workload-identity permissions. Add only the right to assume the TVM role. It
+# gets NO AgentCore Memory permissions: every memory call, including the
+# start-up placeholder, is signed with TVM credentials.
 ctrl = boto3.client("bedrock-agentcore-control", region_name=REGION)
 exec_role_arn  = ctrl.get_agent_runtime(agentRuntimeId=result.agent_id).get("roleArn", "")
 exec_role_name = exec_role_arn.split("/")[-1]
 if not exec_role_name:
     sys.exit("ERROR: could not read the runtime execution role")
 
-account_id = boto3.client("sts").get_caller_identity()["Account"]
-# A geography inference profile id ("us.amazon.nova-pro-v1:0") routes to the
-# base model in several Regions; allow both the profile and the base model.
-base_model = MODEL_ID.split(".", 1)[1] if MODEL_ID.split(".", 1)[0] in {"us", "eu", "apac", "global"} else MODEL_ID
-model_resources = [
-    f"arn:aws:bedrock:*::foundation-model/{base_model}",
-    f"arn:aws:bedrock:{REGION}:{account_id}:inference-profile/{MODEL_ID}",
-]
-
 iam = boto3.client("iam")
+# An earlier version of this sample attached memory permissions under this name.
+try:
+    iam.delete_role_policy(RoleName=exec_role_name, PolicyName="AgentCoreMemoryAndTVMPolicy")
+    print(f"Removed old AgentCoreMemoryAndTVMPolicy from {exec_role_name}")
+except iam.exceptions.NoSuchEntityException:
+    pass
+
 iam.put_role_policy(
     RoleName=exec_role_name,
-    PolicyName="AgentCoreMemoryAndTVMPolicy",
+    PolicyName="AssumeAgentCoreMemoryTVMRole",
     PolicyDocument=json.dumps({
         "Version": "2012-10-17",
         "Statement": [
-            {
-                "Sid": "BedrockInvoke",
-                "Effect": "Allow",
-                "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-                "Resource": model_resources,
-            },
             {
                 "Sid": "STSAssumeAndTagTVMRole",
                 "Effect": "Allow",
@@ -149,7 +143,7 @@ iam.put_role_policy(
         ],
     }),
 )
-print(f"Attached permissions to {exec_role_name}")
+print(f"Attached TVM assume permission to {exec_role_name}")
 
 # Allow the execution role to assume the TVM role (keeps already-trusted principals).
 ensure_trust(TVM_ARN.split("/")[-1], [exec_role_arn])

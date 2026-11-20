@@ -84,6 +84,14 @@ EOF
 )
 
   if aws iam get-role --role-name "$EXEC_ROLE_NAME" &>/dev/null; then
+    OWNED=$(aws iam list-role-tags --role-name "$EXEC_ROLE_NAME" \
+      --query "Tags[?Key=='sample'].Value | [0]" --output text 2>/dev/null || echo "")
+    if [ "$OWNED" != "multi-tenant-agentcore-memory" ]; then
+      echo "ERROR: role '$EXEC_ROLE_NAME' exists but was not created by this sample"
+      echo "       (no tag sample=multi-tenant-agentcore-memory). Not changing it."
+      echo "       Pass your own role ARN as the first argument, or set MEMORY_EXEC_ROLE_NAME."
+      exit 1
+    fi
     aws iam update-assume-role-policy --role-name "$EXEC_ROLE_NAME" \
       --policy-document "$TRUST_POLICY" >/dev/null
   else
@@ -111,13 +119,23 @@ import sys, boto3
 name, region, exec_role = sys.argv[1], sys.argv[2], sys.argv[3]
 client = boto3.client("bedrock-agentcore-control", region_name=region)
 
-# Reuse an existing memory with this name if present, but only if it already
-# has BOTH long-term strategies (USER_PREFERENCE + SEMANTIC). Reusing a memory
-# created without them would silently disable long-term recall with no clear error.
+# Reuse an existing memory with this name only if this sample created it (tag
+# sample=multi-tenant-agentcore-memory) and it already has BOTH long-term
+# strategies (USER_PREFERENCE + SEMANTIC). Reusing a memory created without them
+# would silently disable long-term recall with no clear error.
 for m in client.list_memories().get("memories", []):
     memory_id = m.get("id", "")
     if not memory_id.startswith(f"{name}-"):
         continue
+    tags = client.list_tags_for_resource(resourceArn=m.get("arn", "")).get("tags", {}) if m.get("arn") else {}
+    if tags.get("sample") != "multi-tenant-agentcore-memory":
+        print(
+            f"ERROR: found existing memory '{memory_id}' named '{name}' that this sample "
+            "did not create (no tag sample=multi-tenant-agentcore-memory). Set "
+            "MEMORY_NAME to a new value and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     detail = client.get_memory(memoryId=memory_id).get("memory", {})
     strategies = detail.get("strategies") or detail.get("memoryStrategies") or []
     has_pref = any(

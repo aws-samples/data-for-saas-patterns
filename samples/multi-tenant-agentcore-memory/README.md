@@ -58,7 +58,7 @@ Isolation is enforced in two places:
 
 All tenants share a single AgentCore Memory resource. Isolation and persistence are wired through a custom Strands `SessionManager` (`MultiTenantAgentCoreMemorySessionManager`) rather than in the agent's own logic:
 
-1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC. Before the first request, the SDK's start-up placeholder session runs under TVM credentials tagged with the reserved tenant `_bootstrap`, which no real tenant id can match.
+1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC. Before the first request, the SDK's start-up placeholder session runs under TVM credentials tagged with the reserved tenant `agentcore-bootstrap`, which the tenant id check refuses for real tenants. The SDK's lookups of legacy actor ids (`session_<id>`, `agent_<id>`), which no tenant owns, are skipped.
 
 2. **Short-term memory (conversation history).** Every turn is written to AgentCore Memory as an event under the current `sessionId` via `CreateEvent`. `_prepare` detects when the `session_id` changes and, on change, replaces everything the agent carries from the previous session: `agent.state`, the conversation manager's state and the model state are restored from the new session's stored agent record (or reset to the clean start-up state if it has none), and `agent.messages` is **rehydrated** from AgentCore Memory via `list_messages` (`ListEvents`). Nothing from tenant A's session is written into tenant B's. This matters because on AgentCore Runtime the `Agent` is a module-level singleton whose in-process `agent.messages` is only a *warm-microVM cache*: a "known" `runtimeSessionId` can land on a **fresh microVM** after idle (15 min) or max-lifetime (8 hr) termination, with an empty `agent.messages`. Reading STM back per session change is what makes short-term recall survive a microVM boundary. (Assigning `agent.messages` directly does not re-emit `MessageAddedEvent`, so restored history is not re-persisted.)
 
@@ -126,7 +126,9 @@ python3 examples/multi_tenant_agent.py
 |-----|------|----------|-------------|
 | `tenant_context` | `dict` | Yes | Must contain `tenantId` (letters, digits, `_`, `-`; starts with a letter or digit; at most 57 characters). Activates the STS session tag and identifier scoping |
 | `user_id` | `str` | Yes | User identifier - embedded into `actor_id` and `session_id` |
-| `conversation_id` | `str` | Yes | Scopes short-term working memory to one conversation |
+| `conversation_id` | `str` | Yes | Scopes short-term working memory to one conversation. Letters, digits, `_`, `-`; the full `session_id` must stay within 100 characters |
+
+`user_id` follows the same character rule. A call that fires the hook without these keys, such as `Agent.structured_output`, is refused with `IsolationError`.
 
 ---
 
@@ -216,7 +218,11 @@ The script prints an `export` line for `AGENTCORE_TVM_ROLE_ARN`. Copy it into yo
 export AGENTCORE_TVM_ROLE_ARN=<printed-arn>
 ```
 
-The role trusts only the identity that ran this script (so you can run step 7) and, after step 8, the runtime execution role. Run step 7 with the same identity.
+The role trusts only the identity that ran this script (so you can run step 7) and, after step 8, the runtime execution role. Run step 7 with the same identity. When you no longer need it, take your own identity off the trust policy:
+
+```bash
+python3 scripts/tvm_trust.py --remove agentcore-memory-tvm-role "$(aws sts get-caller-identity --query Arn --output text)"
+```
 
 ### 6. Create the Cognito user pool and test users
 
@@ -263,7 +269,7 @@ Run the deploy:
 bash scripts/setup_agentcore.sh
 ```
 
-The script packages `examples/` + `src/` into a deployment artifact and configures a Cognito JWT authorizer. It gives the execution role permission to invoke the configured model (`BEDROCK_MODEL_ID`, default `amazon.nova-pro-v1:0`) and to assume the TVM role, and adds the execution role to the TVM role's trust policy. The execution role gets no AgentCore Memory permissions. It prints an `export AGENT_ARN=...` line. Copy it into your shell:
+The script deploys `examples/` + `src/` as a code zip (the starter toolkit's direct code deploy) and configures a Cognito JWT authorizer. The toolkit creates the execution role; the script adds permission to assume the TVM role and adds the execution role to the TVM role's trust policy. The execution role gets no AgentCore Memory permissions. It prints an `export AGENT_ARN=...` line. Copy it into your shell:
 
 ```bash
 export AGENT_ARN=<printed-arn>
@@ -395,7 +401,7 @@ Tear down the AWS resources created by the setup scripts, plus local toolkit art
 bash scripts/cleanup.sh
 ```
 
-The runtime is removed with the starter toolkit's destroy operation, which also removes what the toolkit created on deploy (execution role, CodeBuild project and role, ECR repository, S3 artifacts). The memory, the IAM roles and the user pool are deleted only if they carry the tag `sample=multi-tenant-agentcore-memory` that the setup scripts add; anything else with the same name is skipped and reported. Runtime log groups are kept.
+The runtime is removed with the starter toolkit's destroy operation, which also removes what the toolkit created on deploy (the execution role and the S3 code artifacts). The memory, the IAM roles and the user pool are deleted only if they carry the tag `sample=multi-tenant-agentcore-memory` that the setup scripts add; anything else with the same name is skipped and reported. Runtime log groups are kept.
 
 ---
 
@@ -403,8 +409,8 @@ The runtime is removed with the starter toolkit's destroy operation, which also 
 
 - **The tenant id is trusted as it arrives.** IAM checks that every memory call matches the tenant in the session tag; it cannot tell whether that tenant is right. The sample relies on an immutable Cognito attribute in a JWT that AgentCore Runtime verifies.
 - **Isolation between users of one tenant is application-only.** The IAM conditions stop at the tenant prefix.
-- **Start-up writes a placeholder record.** Each fresh microVM writes one session record under the reserved actor `_bootstrap:assistant:init`. It holds no tenant data.
-- **A new session logs one SDK error.** For a session with no stored agent record the SDK also tries a legacy actor id (`agent_<id>`); IAM denies it by design, and the SDK logs `Failed to read agent` and carries on.
+- **Start-up writes a placeholder record once.** The first start-up writes one session record under the reserved actor `agentcore-bootstrap:assistant:init`; later start-ups only read it. It holds no tenant data.
+- **The execution role can invoke any Bedrock model.** The starter toolkit creates the runtime execution role with Bedrock invoke on all foundation models. To narrow it, create your own execution role and pass it to `configure_bedrock_agentcore` (`execution_role`) in `scripts/setup_agentcore.sh`.
 - **SDK internals.** The session manager swaps the SDK's memory clients and mutates its config per request. The SDK versions are pinned; see [Requirements](#requirements).
 
 ---

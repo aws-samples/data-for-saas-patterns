@@ -141,6 +141,15 @@ def _install_bedrock_agentcore_stub():
         def read_agent(self, session_id, agent_id, **kwargs):
             return None
 
+        def read_session(self, session_id, **kwargs):
+            return None
+
+        def create_agent(self, session_id, session_agent, **kwargs):
+            self.created_agents = getattr(self, "created_agents", []) + [(session_id, session_agent)]
+
+        def _fix_broken_tool_use(self, messages):
+            return messages
+
         def list_messages(self, session_id, agent_id, limit=None, offset=0, **kwargs):
             return []
 

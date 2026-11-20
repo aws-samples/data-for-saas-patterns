@@ -45,9 +45,10 @@ _FAILURE_TTL_SECONDS  = 5     # short back-off after an STS failure, then retry
 # RoleSessionName ("tenant-" + id) within the STS 64-character limit.
 TENANT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,56}$")
 
-# Reserved tag for the session manager's start-up placeholder session. It starts
-# with '_', so TENANT_ID_PATTERN can never accept it as a real tenant.
-BOOTSTRAP_TENANT_ID = "_bootstrap"
+# Reserved tag for the session manager's start-up placeholder session. It is a
+# valid AgentCore actor and session id prefix, and validate_tenant_id() refuses
+# it, so no real tenant can ever own it.
+BOOTSTRAP_TENANT_ID = "agentcore-bootstrap"
 
 
 class IsolationError(Exception):
@@ -64,6 +65,8 @@ def validate_tenant_id(tenant_context: Dict) -> str:
             "tenantId must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,56}$ "
             "(no ':' or '/', at most 57 characters)."
         )
+    if tenant_id == BOOTSTRAP_TENANT_ID:
+        raise IsolationError(f"tenantId '{BOOTSTRAP_TENANT_ID}' is reserved.")
     return tenant_id
 
 
@@ -77,8 +80,8 @@ class TokenVendingMachine:
         self.region_name = region_name or os.environ.get("AWS_REGION", "us-east-1")
         self._sts        = boto3.client("sts", region_name=self.region_name)
         self._cache: TTLCache = TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_CACHE_TTL_SECONDS)
-        # tenant id -> monotonic time until which a failed AssumeRole is not retried
-        self._failed_until: Dict[str, float] = {}
+        # Tenants whose last AssumeRole failed; entries expire after the back-off.
+        self._recent_failures: TTLCache = TTLCache(maxsize=_CACHE_MAXSIZE, ttl=_FAILURE_TTL_SECONDS)
         # Logs the role ARN and region only; no credential values.
         logger.debug(  # nosemgrep: python.lang.security.audit.logging.logger-credential-leak.python-logger-credential-disclosure
             "[tvm] TokenVendingMachine init: role_arn=%s region=%s cache_ttl=%ds",
@@ -98,16 +101,27 @@ class TokenVendingMachine:
         """
         return self._assume(validate_tenant_id(tenant_context))
 
-    def get_bootstrap_session(self) -> boto3.Session:
+    def get_bootstrap_session(self, attempts: int = 3, delay_seconds: float = 1.0) -> boto3.Session:
         """
         Return a session tagged with the reserved BOOTSTRAP_TENANT_ID.
 
         Used only for the session manager's start-up placeholder, so it never
         touches AgentCore Memory with the container's own credentials. The
-        reserved tag can only reach actors starting with '_bootstrap:', which no
-        real tenant can own.
+        reserved tag can only reach actors starting with 'agentcore-bootstrap:',
+        which no real tenant can own.
+
+        Runs at container start, so it retries a few times with back-off to ride
+        out a throttle or IAM propagation right after deployment.
         """
-        return self._assume(BOOTSTRAP_TENANT_ID)
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._assume(BOOTSTRAP_TENANT_ID)
+            except IsolationError:
+                if attempt == attempts:
+                    raise
+                self._recent_failures.pop(BOOTSTRAP_TENANT_ID, None)
+                time.sleep(delay_seconds * attempt)
+        raise IsolationError("unreachable")  # pragma: no cover
 
     def _assume(self, tenant_id: str) -> boto3.Session:
         session = self._cache.get(tenant_id)
@@ -115,8 +129,7 @@ class TokenVendingMachine:
             logger.debug("[tvm] get_session: cache hit tenant=%s", tenant_id)
             return session
 
-        retry_at = self._failed_until.get(tenant_id, 0.0)
-        if time.monotonic() < retry_at:
+        if tenant_id in self._recent_failures:
             raise IsolationError(
                 f"STS AssumeRole recently failed for tenant '{tenant_id}' — retrying shortly."
             )
@@ -130,7 +143,7 @@ class TokenVendingMachine:
                 DurationSeconds=900,
             )
         except Exception as exc:
-            self._failed_until[tenant_id] = time.monotonic() + _FAILURE_TTL_SECONDS
+            self._recent_failures[tenant_id] = True
             logger.error(
                 "[tvm] get_session: STS AssumeRole failed tenant=%s error=%s",
                 tenant_id, exc,
@@ -146,7 +159,7 @@ class TokenVendingMachine:
             aws_session_token=creds["SessionToken"],
         )
         self._cache[tenant_id] = session
-        self._failed_until.pop(tenant_id, None)
+        self._recent_failures.pop(tenant_id, None)
         logger.debug(
             "[tvm] get_session: STS AssumeRole succeeded tenant=%s session cached ttl=%ds",
             tenant_id, _CACHE_TTL_SECONDS,
