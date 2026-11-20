@@ -462,13 +462,15 @@ class TestRound3:
                 return []
 
         mgr, agent = _make_ready_manager()
-        mgr.converter = MagicMock()
-        mgr.converter.events_to_messages.side_effect = ValueError("not json")
+        converter = MagicMock()
+        converter.events_to_messages.side_effect = ValueError("not json")
+        mgr.converter = converter
         with patch.object(sm.AgentCoreMemorySessionManager, "list_messages", base_list_messages):
             with pytest.raises(IsolationError, match="history"):
                 mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
         assert agent.messages == []
-        assert mgr.converter.events_to_messages.side_effect is not None  # converter restored
+        assert mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-")
+        assert mgr.converter is converter
 
     def test_clean_snapshot_is_taken_before_the_base_restore(self):
         import bedrock_agentcore.memory.integrations.strands.session_manager as sm

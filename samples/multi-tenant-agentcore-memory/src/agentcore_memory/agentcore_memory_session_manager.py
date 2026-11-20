@@ -297,8 +297,12 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
 
     def _read_messages(self, session_id: str, agent_id: str, offset: int) -> list:
         """
-        list_messages, but a read error or an event that cannot be converted
-        raises instead of returning [] (the SDK swallows both).
+        list_messages, but a read error or a conversational event that cannot be
+        converted raises instead of returning [] (the SDK swallows both).
+
+        Messages too large for a conversational event are stored as blobs; the
+        SDK's converter skips an unreadable blob itself, so such a message is
+        dropped rather than failing the read.
         """
         status = {"failed": False}
         inner  = self.converter

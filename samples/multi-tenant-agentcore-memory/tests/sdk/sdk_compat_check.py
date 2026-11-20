@@ -16,8 +16,12 @@ It checks that:
   * a request through the real BeforeInvocationEvent hook restores the stored
     agent state and transcript of its own session;
   * agent state and transcript from tenant A do not reach tenant B;
-  * a second boot uses the state the code builds, not an earlier boot's;
-  * a failed history read fails the request and unbinds the agent;
+  * a failed agent-record read, a failed history read and a corrupt history
+    event each fail the request and unbind the agent;
+  * a second boot uses the state the code builds, not the first boot's
+    placeholder (with the default conversation manager this needs both the
+    placeholder guard and the snapshot order to regress; the unit tests cover
+    each one alone);
   * the SDK internals the session manager relies on still exist.
 
 Run by tests/sdk/test_sdk_compat.py in a separate process, so the stubs in
