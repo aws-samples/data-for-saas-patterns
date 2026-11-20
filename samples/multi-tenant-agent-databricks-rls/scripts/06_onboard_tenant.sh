@@ -75,6 +75,19 @@ if [[ -z "$APP_ID" ]]; then
 else
   echo "  ✓ ${SP_NAME} (created, applicationId: ${APP_ID:0:8}...)"
 fi
+
+# Grant the databricks-sql-access entitlement so the SP can call the SQL
+# Statement Execution API (otherwise queries fail with HTTP 403
+# "This API is disabled for users without the databricks-sql-access ...").
+# Idempotent.
+if [[ -n "$SP_ID" ]]; then
+  curl -s -X PATCH "${DATABRICKS_HOST}/api/2.0/preview/scim/v2/ServicePrincipals/${SP_ID}" \
+    -H "Authorization: Bearer ${DATABRICKS_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{"schemas":["urn:ietf:params:scim:api:messages:2.0:PatchOp"],"Operations":[{"op":"add","path":"entitlements","value":[{"value":"databricks-sql-access"}]}]}' \
+    > /dev/null 2>&1
+  echo "  ✓ databricks-sql-access entitlement granted"
+fi
 echo ""
 
 # Step 2: Grant permissions

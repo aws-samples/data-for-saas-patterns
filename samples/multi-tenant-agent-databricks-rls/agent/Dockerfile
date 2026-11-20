@@ -1,4 +1,10 @@
-FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# Python base pulled from the Amazon ECR Public mirror of the Docker Official
+# Image (no Docker Hub rate limits). uv is not published to ECR Public — Astral
+# ships it only to GHCR / Docker Hub — so we install it into this base below
+# rather than pulling an external uv image.
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/python:3.12-slim-bookworm
+
+RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 

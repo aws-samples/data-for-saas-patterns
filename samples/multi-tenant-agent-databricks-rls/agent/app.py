@@ -9,6 +9,7 @@ Tenant isolation is enforced by the Gateway + Interceptor + Databricks Unity Cat
 The agent code is 100% tenant-unaware. Same code, same model, same prompt.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -22,7 +23,7 @@ from typing import Dict, Any
 from strands import Agent
 from strands.models import BedrockModel
 from strands.tools.mcp import MCPClient
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client, create_mcp_http_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +45,29 @@ When users ask about their data, use the query tools to fetch results and presen
 """
 
 app = FastAPI(title="Multi-Tenant Databricks Agent", version="1.0.0")
+
+
+@contextlib.asynccontextmanager
+async def _gateway_transport(url: str, auth_token: str):
+    """StreamableHTTP transport for the AgentCore Gateway.
+
+    mcp 2.1.1 removed the `headers=` kwarg from streamable_http_client; auth now travels on a
+    caller-supplied httpx2 client. The Authorization bearer JWT is how the per-tenant identity
+    reaches the Gateway — tenant isolation depends on it. streamable_http_client does NOT close a
+    caller-provided client, so we own its lifecycle here (one client per request, closed on exit).
+    """
+    async with create_mcp_http_client(
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "Mcp-Protocol-Version": "2025-11-25",
+        }
+    ) as http_client:
+        async with streamable_http_client(
+            url=url,
+            http_client=http_client,
+            terminate_on_close=True,
+        ) as streams:
+            yield streams
 
 
 class InvocationRequest(BaseModel):
@@ -79,15 +103,7 @@ async def invoke_agent(request: Request):
         # Create agent with MCP client pointing to Gateway
         model = BedrockModel(model_id=MODEL_ID)
 
-        mcp_client = MCPClient(
-            lambda: streamablehttp_client(
-                url=GATEWAY_URL,
-                headers={
-                    "Authorization": f"Bearer {auth_token}",
-                    "Mcp-Protocol-Version": "2025-11-25",
-                },
-            )
-        )
+        mcp_client = MCPClient(lambda: _gateway_transport(GATEWAY_URL, auth_token))
 
         with mcp_client:
             tools = mcp_client.list_tools_sync()
@@ -123,4 +139,7 @@ async def ping():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # nosec B104 - binding to 0.0.0.0 is required by Bedrock AgentCore Runtime,
+    # which routes traffic to the container on 0.0.0.0:8080; localhost would
+    # make the agent unreachable. The container has no other listener.
+    uvicorn.run(app, host="0.0.0.0", port=8080)  # nosec B104
