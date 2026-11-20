@@ -50,7 +50,8 @@ from agentcore_memory import (  # noqa: E402
 memory_clients = []   # (tenant tag or None, service name)
 denied = []           # (tag, actor) pairs IAM would have refused
 store = {}            # (actor, session) -> {"agent": [events], "messages": [events]}
-failing_actors = set()
+failing_record_reads = set()    # actors whose agent-record read is throttled
+failing_history_reads = set()   # actors whose transcript read is throttled
 
 
 def _deny(op):
@@ -72,7 +73,11 @@ def fake_client(self, service_name, *args, **kwargs):
             if not _allowed(tag, kw.get("actorId")):
                 denied.append((tag, kw.get("actorId")))
                 raise _deny("CreateEvent")
-            return {"event": {"eventId": "e-1"}}
+            state_type = (kw.get("metadata") or {}).get("stateType", {}).get("stringValue")
+            kind = {"AGENT": "agent", "SESSION": "session"}.get(state_type, "messages")
+            entry = store.setdefault((kw["actorId"], kw.get("sessionId")), {})
+            entry.setdefault(kind, []).insert(0, {"payload": kw.get("payload", [])})  # newest first
+            return {"event": {"eventId": f"e-{len(entry[kind])}"}}
 
         client.create_event.side_effect = create_event
     return client
@@ -83,10 +88,15 @@ def fake_list_events(self, memory_id, actor_id, session_id, event_metadata=None,
     if not _allowed(tag, actor_id):
         denied.append((tag, actor_id))
         raise _deny("ListEvents")
-    if actor_id in failing_actors:
-        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListEvents")
-    entry = store.get((actor_id, session_id), {})
-    return list(entry.get("agent" if event_metadata else "messages", []))
+    if event_metadata:
+        kind = "session" if '"SESSION"' in json.dumps(event_metadata, default=str) else "agent"
+        if actor_id in failing_record_reads:
+            raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListEvents")
+    else:
+        kind = "messages"
+        if actor_id in failing_history_reads:
+            raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ListEvents")
+    return list(store.get((actor_id, session_id), {}).get(kind, []))
 
 
 def fake_assume(self, tenant_id):
@@ -159,13 +169,28 @@ with patch.object(boto3.session.Session, "client", fake_client), \
     if not mgr.config.actor_id.startswith("tenant-002:"):
         problems.append(f"unexpected actor id {mgr.config.actor_id}")
 
-    failing_actors.add(f"tenant-003:{AGENT_NAME}:user-1")
-    try:
-        invoke_hook(agent, "tenant-003", "user-1", "conv-1")
-        problems.append("a failed history read did not fail the request")
-    except IsolationError:
-        if not mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-") or agent.messages:
-            problems.append("agent not unbound after a failed history read")
+    def expect_unbound(label, tenant):
+        try:
+            invoke_hook(agent, tenant, "user-1", "conv-1")
+            problems.append(f"{label} did not fail the request")
+        except IsolationError:
+            if not mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-") or agent.messages:
+                problems.append(f"agent not unbound after {label}")
+
+    failing_record_reads.add(f"tenant-003:{AGENT_NAME}:user-1")
+    expect_unbound("a failed agent-record read", "tenant-003")
+
+    failing_history_reads.add(f"tenant-005:{AGENT_NAME}:user-1")
+    expect_unbound("a failed history read", "tenant-005")
+
+    seed("tenant-006", "user-1", "conv-1", {}, "unused")
+    store[(f"tenant-006:{AGENT_NAME}:user-1", f"tenant-006-{AGENT_NAME}-user-1-conv-1")]["messages"] = [
+        {"payload": [{"conversational": {"content": {"text": "not json"}, "role": "USER"}}]}
+    ]
+    expect_unbound("a corrupt history event", "tenant-006")
+
+    if not store.get((f"{BOOTSTRAP_TENANT_ID}:{AGENT_NAME}:init", f"{BOOTSTRAP_TENANT_ID}-{AGENT_NAME}-init")):
+        problems.append("first boot did not write the placeholder record the second boot must ignore")
 
     try:
         mgr2, agent2 = build({"v": 2})

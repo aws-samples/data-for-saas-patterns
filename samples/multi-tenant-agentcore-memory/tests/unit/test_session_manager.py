@@ -438,11 +438,37 @@ class TestRound3:
                 mgr.read_agent("s", agent.agent_id)
 
     def test_placeholder_records_are_never_read(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
         mgr = _make_manager()
-        mgr.memory_client.list_events = MagicMock()
-        assert mgr.read_session(mgr._placeholder_session) is None
-        assert mgr.read_agent(mgr._placeholder_session, "agent-1") is None
-        mgr.memory_client.list_events.assert_not_called()
+        with patch.object(sm.AgentCoreMemorySessionManager, "read_session") as base_session, \
+             patch.object(sm.AgentCoreMemorySessionManager, "read_agent") as base_agent:
+            assert mgr.read_session(mgr._placeholder_session) is None
+            assert mgr.read_agent(mgr._placeholder_session, "agent-1") is None
+            base_session.assert_not_called()
+            base_agent.assert_not_called()
+            # A tenant session still goes to the base implementation.
+            base_agent.return_value = None
+            mgr.config.actor_id = "tenant-001:assistant:u"
+            mgr.read_agent("tenant-001-assistant-u-c", "agent-1")
+            base_agent.assert_called_once()
+
+    def test_corrupt_history_event_fails_the_read(self):
+        import bedrock_agentcore.memory.integrations.strands.session_manager as sm
+
+        def base_list_messages(mgr_self, session_id, agent_id, limit=None, offset=0, **kwargs):
+            try:  # the SDK converts inside a catch-all and returns []
+                return mgr_self.converter.events_to_messages([{"payload": []}])
+            except Exception:
+                return []
+
+        mgr, agent = _make_ready_manager()
+        mgr.converter = MagicMock()
+        mgr.converter.events_to_messages.side_effect = ValueError("not json")
+        with patch.object(sm.AgentCoreMemorySessionManager, "list_messages", base_list_messages):
+            with pytest.raises(IsolationError, match="history"):
+                mgr._prepare(agent, TENANT_1, "user-1", "conv-1")
+        assert agent.messages == []
+        assert mgr.converter.events_to_messages.side_effect is not None  # converter restored
 
     def test_clean_snapshot_is_taken_before_the_base_restore(self):
         import bedrock_agentcore.memory.integrations.strands.session_manager as sm

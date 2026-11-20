@@ -232,7 +232,7 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         if len(session_id) > _MAX_SESSION_ID_LENGTH:
             raise IsolationError(
                 f"session id would be {len(session_id)} characters; AgentCore allows "
-                f"{_MAX_SESSION_ID_LENGTH}. tenant id, agent name, user id and "
+                f"{_MAX_SESSION_ID_LENGTH}. Tenant id, agent name, user id and "
                 "conversation id share that limit."
             )
         return session_id
@@ -279,6 +279,8 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         # whatever an earlier deploy stored there.
         if self._is_placeholder(session_id):
             return None
+        # Only the base __init__ calls read_session today, always for the
+        # placeholder; this keeps any future caller on the current actor.
         with self._current_actor_only():
             return super().read_session(session_id, **kwargs)
 
@@ -294,10 +296,31 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         return result
 
     def _read_messages(self, session_id: str, agent_id: str, offset: int) -> list:
-        """list_messages, but a read error raises instead of returning []."""
-        with self._current_actor_only() as status:
-            messages = self.list_messages(session_id, agent_id, offset=offset)
-        if status["failed"]:
+        """
+        list_messages, but a read error or an event that cannot be converted
+        raises instead of returning [] (the SDK swallows both).
+        """
+        status = {"failed": False}
+        inner  = self.converter
+
+        class _FlaggingConverter:
+            def __getattr__(self, name):
+                return getattr(inner, name)
+
+            def events_to_messages(self, events):
+                try:
+                    return inner.events_to_messages(events)
+                except Exception:
+                    status["failed"] = True
+                    raise
+
+        self.converter = _FlaggingConverter()
+        try:
+            with self._current_actor_only() as read_status:
+                messages = self.list_messages(session_id, agent_id, offset=offset)
+        finally:
+            self.converter = inner
+        if read_status["failed"] or status["failed"]:
             raise IsolationError("could not read the conversation history.")
         return messages
 

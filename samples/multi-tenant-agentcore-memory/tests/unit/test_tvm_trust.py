@@ -134,3 +134,14 @@ def test_remove_refuses_untagged_role():
     with _patch(iam), pytest.raises(SystemExit):
         tvm_trust.remove_trust("tvm", [OPERATOR])
     iam.update_assume_role_policy.assert_not_called()
+
+
+def test_single_statement_object_is_accepted():
+    existing = _existing([OPERATOR])
+    existing["AssumeRolePolicyDocument"]["Statement"] = existing["AssumeRolePolicyDocument"]["Statement"][0]
+    assert tvm_trust.current_principals(existing) == [OPERATOR]
+    iam = _iam(existing)
+    with _patch(iam):
+        tvm_trust.ensure_trust("tvm", [EXEC_ROLE])
+    doc = json.loads(iam.update_assume_role_policy.call_args.kwargs["PolicyDocument"])
+    assert len(doc["Statement"]) == 1

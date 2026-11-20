@@ -128,6 +128,7 @@ def _install_bedrock_agentcore_stub():
             self.boto_session   = boto_session
             self.session_id     = getattr(agentcore_memory_config, "session_id", None)
             self.memory_client  = MagicMock()
+            self.converter      = MagicMock()
             self._latest_agent_message = {}
             self._last_synced_internal_state = {}
             self._held_records = {}

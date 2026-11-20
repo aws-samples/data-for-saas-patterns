@@ -4,11 +4,13 @@
 """
 tvm_trust.py — Create the TVM role, or add or remove principals in its trust policy.
 
-The TVM role trusts only the principals named here (the operator who ran the
-setup, and the AgentCore Runtime execution role), and only when the caller sets
-exactly one session tag, TenantID, whose value holds no ':' or '/' (the actorId
-and namespace separators). Principals already trusted are kept, so re-running a
-setup script never drops the execution role.
+The sample's trust statement allows only the principals named here (the
+operator who ran the setup, and the AgentCore Runtime execution role), and only
+when the caller sets exactly one session tag, TenantID, whose value is non-empty
+and holds no ':' or '/' (the actorId and namespace separators). Principals
+already trusted are kept, so re-running a setup script never drops the
+execution role. Any other statements someone added to the trust policy are kept
+as they are and are not checked; review them yourself.
 
 Usage:
   python3 tvm_trust.py <role-name> <principal-arn> [<principal-arn> ...]
@@ -37,6 +39,12 @@ def resolve_principal(arn: str, iam) -> str:
     return arn
 
 
+def _statements(doc) -> list:
+    """Statement as a list (IAM also allows a single statement object)."""
+    statements = (doc or {}).get("Statement", [])
+    return [statements] if isinstance(statements, dict) else list(statements)
+
+
 def trust_policy(account_id: str, principals: list, existing: dict = None) -> dict:
     """Build the trust policy; statements other than ours in `existing` are kept."""
     ours = {
@@ -52,12 +60,12 @@ def trust_policy(account_id: str, principals: list, existing: dict = None) -> di
             "StringNotLike": {"aws:RequestTag/TenantID": ["*:*", "*/*"]},
         },
     }
-    others = [s for s in (existing or {}).get("Statement", []) if s.get("Sid") != SID]
+    others = [s for s in _statements(existing) if s.get("Sid") != SID]
     return {"Version": "2012-10-17", "Statement": others + [ours]}
 
 
 def current_principals(role: dict) -> list:
-    for stmt in role.get("AssumeRolePolicyDocument", {}).get("Statement", []):
+    for stmt in _statements(role.get("AssumeRolePolicyDocument")):
         if stmt.get("Sid") == SID:
             value = stmt.get("Condition", {}).get("ArnEquals", {}).get("aws:PrincipalArn", [])
             return [value] if isinstance(value, str) else list(value)
