@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
 # setup_memory.sh — Creates an AgentCore Memory resource with two long-term
 # memory strategies (USER_PREFERENCE + SEMANTIC) and waits for it to become
 # ACTIVE.
@@ -86,7 +89,8 @@ EOF
   else
     aws iam create-role --role-name "$EXEC_ROLE_NAME" \
       --assume-role-policy-document "$TRUST_POLICY" \
-      --description "AgentCore Memory long-term extraction execution role" >/dev/null
+      --description "AgentCore Memory long-term extraction execution role" \
+      --tags Key=sample,Value=multi-tenant-agentcore-memory >/dev/null
     sleep 10  # allow IAM propagation before CreateMemory references it
   fi
 
@@ -142,6 +146,7 @@ resp = client.create_memory(
     name=name,
     eventExpiryDuration=90,
     memoryExecutionRoleArn=exec_role,
+    tags={"sample": "multi-tenant-agentcore-memory"},
     memoryStrategies=[
         {
             "userPreferenceMemoryStrategy": {
@@ -175,6 +180,7 @@ if [ -z "$MEMORY_ID" ]; then
 fi
 
 echo "→ Memory ID: $MEMORY_ID — waiting for ACTIVE ..."
+STATUS="UNKNOWN"
 for i in $(seq 1 40); do
   STATUS=$(aws bedrock-agentcore-control get-memory --memory-id "$MEMORY_ID" \
     --region "$REGION" --query "memory.status" --output text 2>/dev/null || echo "UNKNOWN")
@@ -182,9 +188,20 @@ for i in $(seq 1 40); do
     echo "  Memory ACTIVE ✓"
     break
   fi
+  if [ "$STATUS" = "FAILED" ]; then
+    echo ""
+    echo "  ERROR: memory $MEMORY_ID entered FAILED state."
+    exit 1
+  fi
   printf "  Status: %s (%ds)\r" "$STATUS" $((i * 5))
   sleep 5
 done
+
+if [ "$STATUS" != "ACTIVE" ]; then
+  echo ""
+  echo "  ERROR: memory $MEMORY_ID is still $STATUS after 200 s. Check it and re-run."
+  exit 1
+fi
 
 MEMORY_ARN="arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:memory/${MEMORY_ID}"
 

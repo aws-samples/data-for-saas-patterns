@@ -1,6 +1,6 @@
 # Multi-tenant AgentCore Memory for Strands Agents
 
-A tenant-isolated [Strands](https://strandsagents.com/) `SessionManager` that gives any Strands Agent persistent memory backed by [Amazon Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory.html). Multiple tenants share a single AgentCore Memory resource, but every memory operation is scoped to a single tenant at two independent layers - the application layer (identifier construction) and the AWS IAM control plane (ABAC on a [Token Vending Machine](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/implement-saas-tenant-isolation-for-amazon-s3-by-using-an-aws-lambda-token-vending-machine.html) role).
+A tenant-isolated [Strands](https://strandsagents.com/) `SessionManager` that gives any Strands Agent persistent memory backed by [Amazon Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory.html). Multiple tenants share a single AgentCore Memory resource, but every memory operation is scoped to a single tenant in two places: the application (identifier construction) and AWS IAM (ABAC conditions on a [Token Vending Machine](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/implement-saas-tenant-isolation-for-amazon-s3-by-using-an-aws-lambda-token-vending-machine.html) role that signs every memory call).
 
 ---
 
@@ -10,7 +10,7 @@ Agent memory is one of the hardest multi-tenant surfaces to isolate because it i
 
 This sample bakes isolation into the framework configuration and the IAM role instead:
 
-1. **Two-layer isolation.** At the application layer, `actor_id` and `session_id` embed `tenantId` so identifiers never collide across tenants. At the IAM layer, STS AssumeRole with a `TenantID` session tag enforces isolation at the control plane - even a buggy agent that constructs the wrong `actor_id` is denied by AWS.
+1. **Isolation in two places.** In the application, `actor_id` and `session_id` embed `tenantId` so identifiers never collide across tenants. In IAM, every memory call is signed with credentials from STS AssumeRole with a `TenantID` session tag, and the role's conditions make AWS deny any actor or namespace of another tenant. A bug that builds the wrong `actor_id` is denied by AWS. Both places take the tenant from the same verified JWT claim, so that claim is made immutable (see [What IAM does and does not catch](#what-iam-does-and-does-not-catch)).
 
 2. **One shared memory resource.** Unlike an index-per-tenant design, all tenants use a single AgentCore Memory resource. Isolation comes from the `actor_id`/`namespace` IAM conditions, not from separate resources, so onboarding a tenant requires no new infrastructure.
 
@@ -20,7 +20,7 @@ This sample bakes isolation into the framework configuration and the IAM role in
 
 ## Architecture
 
-Multiple tenants share one Strands agent, one AgentCore Memory resource, and one TVM IAM role - there is no per-tenant infrastructure to provision or manage. The agent runs as a singleton on AgentCore Runtime, so it must stay safe to invoke concurrently on behalf of any tenant, request by request.
+Multiple tenants share one Strands agent, one AgentCore Memory resource, and one TVM IAM role - there is no per-tenant infrastructure to provision or manage. The agent is a module-level singleton that serves any tenant, request by request. AgentCore Runtime gives each runtime session its own microVM; if two requests overlap on one microVM, Strands rejects the second with `ConcurrencyException` rather than run them interleaved, and the caller gets the generic error.
 
 A request arrives as an HTTP call to AgentCore Runtime carrying a Cognito-issued JWT. AgentCore Runtime validates the JWT's signature via its built-in authorizer and forwards it to the container. The agent code decodes the JWT's claims (never trusting anything from the request body) to get `tenant_id` and the user's `sub`, and passes them into the agent call as `invocation_state`.
 
@@ -28,10 +28,21 @@ Before the agent's model runs, the `MultiTenantAgentCoreMemorySessionManager` ho
 
 ![Architecture diagram](images/architecture.png)
 
-Isolation is enforced at two independent layers:
+Isolation is enforced in two places:
 
-- **Application layer** - `actor_id` is `{tenantId}:{agentName}:{userId}` and `session_id` is `{tenantId}-{agentName}-{userId}-{conversationId}`. Every memory event is stored under a tenant-scoped identifier.
-- **IAM layer** - the TVM role's condition `bedrock-agentcore:actorId = "${aws:PrincipalTag/TenantID}:*"` enforces that a session tagged `TenantID=tenant-001` can only access actors starting with `tenant-001:`. A parallel `bedrock-agentcore:namespacePath` condition scopes long-term (semantic) memory retrieval.
+- **Application** - `actor_id` is `{tenantId}:{agentName}:{userId}` and `session_id` is `{tenantId}-{agentName}-{userId}-{conversationId}`. Every memory event is stored under a tenant-scoped identifier. Tenant ids are validated (`^[A-Za-z0-9][A-Za-z0-9_-]{0,56}$`), so a tenant id can never contain the `:` or `/` separators.
+- **IAM** - the TVM role's condition `bedrock-agentcore:actorId = "${aws:PrincipalTag/TenantID}:*"` enforces that a session tagged `TenantID=tenant-001` can only access actors starting with `tenant-001:`. A parallel `bedrock-agentcore:namespacePath` condition scopes long-term (semantic) memory retrieval. The runtime execution role has **no** AgentCore Memory permissions: every memory call, including the SDK's start-up placeholder session, runs under TVM credentials.
+
+### What IAM does and does not catch
+
+| Failure | Caught by |
+|---|---|
+| Code builds another tenant's `actor_id` or namespace | IAM denies the call (`AccessDeniedException`) |
+| Code calls AgentCore Memory with the container's own credentials | IAM denies it: the execution role has no memory permissions |
+| Another principal in the account tries to mint a tenant's credentials | The TVM trust policy names only the runtime execution role and the operator who ran the setup, and requires the `TenantID` tag |
+| A user tries to change their own `custom:tenant_id` | Cognito: the attribute is immutable and the app client cannot write it |
+| A wrong tenant id arrives in a valid token | **Nothing.** Both places trust the tenant from the JWT, so it must come from a source the user cannot change |
+| User A of a tenant reads user B of the same tenant | Application only: the IAM condition is `${TenantID}:*` |
 
 ### AgentCore Memory identifiers
 
@@ -47,13 +58,13 @@ Isolation is enforced at two independent layers:
 
 All tenants share a single AgentCore Memory resource. Isolation and persistence are wired through a custom Strands `SessionManager` (`MultiTenantAgentCoreMemorySessionManager`) rather than in the agent's own logic:
 
-1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC, not ambient container credentials.
+1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC. Before the first request, the SDK's start-up placeholder session runs under TVM credentials tagged with the reserved tenant `_bootstrap`, which no real tenant id can match.
 
-2. **Short-term memory (conversation history).** Every turn is written to AgentCore Memory as an event under the current `sessionId` via `CreateEvent`. `_prepare` detects when the `session_id` changes and, on change, **rehydrates** `agent.messages` from AgentCore Memory via `list_messages` (`ListEvents`). This matters because on AgentCore Runtime the `Agent` is a module-level singleton whose in-process `agent.messages` is only a *warm-microVM cache*: a "known" `runtimeSessionId` can land on a **fresh microVM** after idle (15 min) or max-lifetime (8 hr) termination, with an empty `agent.messages`. Reading STM back per session change is what makes short-term recall survive a microVM boundary. (Assigning `agent.messages` directly does not re-emit `MessageAddedEvent`, so restored history is not re-persisted.)
+2. **Short-term memory (conversation history).** Every turn is written to AgentCore Memory as an event under the current `sessionId` via `CreateEvent`. `_prepare` detects when the `session_id` changes and, on change, replaces everything the agent carries from the previous session: `agent.state`, the conversation manager's state and the model state are restored from the new session's stored agent record (or reset to the clean start-up state if it has none), and `agent.messages` is **rehydrated** from AgentCore Memory via `list_messages` (`ListEvents`). Nothing from tenant A's session is written into tenant B's. This matters because on AgentCore Runtime the `Agent` is a module-level singleton whose in-process `agent.messages` is only a *warm-microVM cache*: a "known" `runtimeSessionId` can land on a **fresh microVM** after idle (15 min) or max-lifetime (8 hr) termination, with an empty `agent.messages`. Reading STM back per session change is what makes short-term recall survive a microVM boundary. (Assigning `agent.messages` directly does not re-emit `MessageAddedEvent`, so restored history is not re-persisted.)
 
 3. **Long-term memory (durable preferences + facts).** The Memory resource is created with **two** strategies: a `USER_PREFERENCE` strategy at `/{actorId}/preferences` and a `SEMANTIC` strategy at `/{actorId}/facts`. AgentCore asynchronously extracts durable preferences and facts from conversation events (using a service-managed Bedrock model via the memory execution role) and stores them under those namespaces. The session manager's `retrieval_config` points at the same two namespaces, so before each turn the framework retrieves any matching records and injects them into the prompt as a `<user_context>` block - enabling recall across different conversations, not just within one session.
 
-4. **Tenant isolation at the control plane.** Because `actor_id` and the resolved namespaces (`/tenant-001:assistant:user-456/preferences`, `/.../facts`) always begin with the tenant id, the TVM role's `actorId` and `namespacePath` ABAC conditions physically deny any cross-tenant read or write at the AWS control plane - regardless of what the application code does.
+4. **Tenant isolation in IAM.** Because `actor_id` and the resolved namespaces (`/tenant-001:assistant:user-456/preferences`, `/.../facts`) always begin with the tenant id, the TVM role's `actorId` and `namespacePath` ABAC conditions make AWS deny any cross-tenant read or write, whatever identifier the code builds. They cannot catch a wrong tenant id coming in (see the table above).
 
 **STM vs LTM - two distinct read paths.** Short-term memory is the ordered transcript for one `sessionId`, restored into `agent.messages` once per session change. Long-term memory is facts/preferences retrieved by semantic search on every turn via `retrieval_config`. STM recall is scoped to one conversation; LTM recall spans conversations for the same actor.
 
@@ -103,7 +114,7 @@ agent("What is my favourite colour?", invocation_state={
 
 `MultiTenantAgentCoreMemorySessionManager` requires `tvm_role_arn` (passed directly or via `AGENTCORE_TVM_ROLE_ARN`). Omitting it raises `ValueError` to prevent silently running with ambient credentials and bypassing IAM ABAC isolation.
 
-To run the example server locally instead of deploying, start it after setting `AGENTCORE_MEMORY_ID`, `AGENTCORE_TVM_ROLE_ARN`, and `AWS_REGION`. The server listens on `http://127.0.0.1:8080`:
+To run the example server locally instead of deploying, start it after setting `AGENTCORE_MEMORY_ID`, `AGENTCORE_TVM_ROLE_ARN`, and `AWS_REGION`. The server listens on `http://127.0.0.1:8080`. Locally nothing verifies the JWT (AgentCore Runtime does that when deployed), so any hand-made token picks any tenant; use it only on your own machine:
 
 ```bash
 python3 examples/multi_tenant_agent.py
@@ -113,7 +124,7 @@ python3 examples/multi_tenant_agent.py
 
 | Key | Type | Required | Description |
 |-----|------|----------|-------------|
-| `tenant_context` | `dict` | Yes | Must contain `tenantId`. Activates the STS session tag and identifier scoping |
+| `tenant_context` | `dict` | Yes | Must contain `tenantId` (letters, digits, `_`, `-`; starts with a letter or digit; at most 57 characters). Activates the STS session tag and identifier scoping |
 | `user_id` | `str` | Yes | User identifier - embedded into `actor_id` and `session_id` |
 | `conversation_id` | `str` | Yes | Scopes short-term working memory to one conversation |
 
@@ -122,13 +133,15 @@ python3 examples/multi_tenant_agent.py
 ## Requirements
 
 - Python 3.10+
-- `strands-agents >= 1.56.0`
+- `strands-agents >= 1.65.0, < 1.66`
 - `boto3 >= 1.34`
 - `cachetools >= 5.3` (used by the TVM for credential caching)
-- `bedrock-agentcore[strands-agents] >= 1.23.1` (1.23.1 fixes a `strands` import incompatibility present in 1.23.0)
-- `bedrock-agentcore-starter-toolkit >= 0.1.0` (for AgentCore Runtime deployment - install via `pip install -e ".[agentcore]"`)
+- `bedrock-agentcore[strands-agents] >= 1.26.1, < 1.27`
+- `bedrock-agentcore-starter-toolkit >= 0.3.14, < 0.4` (for AgentCore Runtime deployment - install via `pip install -e ".[agentcore]"`)
 - AWS account with Bedrock AgentCore Memory access and a Bedrock text model enabled in your region (default `amazon.nova-pro-v1:0`)
 - AWS CLI v2 configured with credentials that can access IAM, Bedrock, Bedrock AgentCore, Cognito, and STS
+
+The session manager uses SDK internals that are not a public API, so the SDK versions are pinned to the range `tests/sdk/test_sdk_compat.py` has run against. Run that test before widening the range.
 
 ---
 
@@ -172,8 +185,10 @@ pip install -e ".[dev]"
 Run the tests:
 
 ```bash
-python3 -m pytest tests/unit/ -q
+python3 -m pytest tests/ -q
 ```
+
+`tests/unit/` stubs the SDKs. `tests/sdk/` runs the session manager against the installed SDKs, with AWS calls mocked, and checks that no memory client is built from the container's own credentials and that agent state does not cross a tenant switch.
 
 ### 4. Create the AgentCore Memory resource
 
@@ -201,41 +216,46 @@ The script prints an `export` line for `AGENTCORE_TVM_ROLE_ARN`. Copy it into yo
 export AGENTCORE_TVM_ROLE_ARN=<printed-arn>
 ```
 
+The role trusts only the identity that ran this script (so you can run step 7) and, after step 8, the runtime execution role. Run step 7 with the same identity.
+
 ### 6. Create the Cognito user pool and test users
 
 ```bash
 bash scripts/setup_cognito.sh
 ```
 
-Each test user carries a `custom:tenant_id` claim (`tenant-001`, `tenant-002`) that the agent reads from the JWT to build tenant-scoped identifiers. The script prints `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, the test usernames, and the password. Copy the values into your shell:
+Each test user carries a `custom:tenant_id` claim (`tenant-001`, `tenant-002`) that the agent reads from the JWT to build tenant-scoped identifiers. The attribute is immutable and the app client cannot write it, so a signed-in user cannot switch tenant. The script prints `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, the test usernames, and a password generated for this run. Copy the values into your shell:
 
 ```bash
 export COGNITO_USER_POOL_ID=<printed>
 export COGNITO_CLIENT_ID=<printed>
-export COGNITO_USER_PASSWORD=<printed>
+export COGNITO_USER_PASSWORD='<printed>'
 ```
 
-### 7. Prove isolation at the IAM control plane
+The script refuses to reuse a pool of the same name that it did not create (untagged, or with a mutable `custom:tenant_id`), and prints the delete command instead of deleting it.
 
-The `prove_isolation.py` script bypasses the agent entirely and calls the AgentCore Memory API directly with TVM-scoped credentials, proving that tenant-002 is *physically denied* from accessing tenant-001's memory. This is not application-level filtering - it is IAM enforcement. Even if the agent code had a bug and tried to read another tenant's memory, the AWS control plane would deny it.
+### 7. Prove isolation in IAM
+
+The `prove_isolation.py` script bypasses the agent entirely and calls the AgentCore Memory API directly with TVM-scoped credentials. It checks that tenant-002's credentials are denied when they read tenant-001's events, write an event as a tenant-001 actor, or retrieve tenant-001's long-term records. This is IAM authorisation on every call, not application filtering: code that builds a wrong identifier is denied by AWS.
 
 ```bash
 python3 examples/prove_isolation.py
 ```
 
-Expected output:
+Expected output (the script exits non-zero if any check fails):
 
 ```
--- Step 1: Tenant-001 accesses OWN memory (should succeed) --
-  ✓ SUCCESS - tenant-001 listed events (count: ...)
+  ✓ 1. tenant-001 lists its own events: allowed
+  ✓ 2. tenant-002 lists tenant-001's events: denied by IAM (AccessDeniedException)
+  ✓ 3. tenant-002 writes an event as tenant-001: denied by IAM (AccessDeniedException)
+  ✓ 4. tenant-002 retrieves tenant-001's long-term records: denied by IAM (AccessDeniedException)
 
--- Step 2: Tenant-002 accesses TENANT-001's memory (should DENY) --
-  ✓ ISOLATION CONFIRMED - IAM denied the request
+-- Summary: 4/4 checks as expected --
 ```
 
 ### 8. Deploy to AgentCore Runtime
 
-Ensure the prerequisite variables from the earlier steps are exported: `AGENTCORE_MEMORY_ID`, `AGENTCORE_MEMORY_ARN`, `AGENTCORE_TVM_ROLE_ARN`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`.
+Ensure the prerequisite variables from the earlier steps are exported: `AGENTCORE_MEMORY_ID`, `AGENTCORE_TVM_ROLE_ARN`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`.
 
 Run the deploy:
 
@@ -243,7 +263,7 @@ Run the deploy:
 bash scripts/setup_agentcore.sh
 ```
 
-The script packages `examples/` + `src/` into a deployment artifact, configures a Cognito JWT authorizer, and attaches the Bedrock, TVM, and AgentCore Memory permissions to the execution role. It prints an `export AGENT_ARN=...` line. Copy it into your shell:
+The script packages `examples/` + `src/` into a deployment artifact and configures a Cognito JWT authorizer. It gives the execution role permission to invoke the configured model (`BEDROCK_MODEL_ID`, default `amazon.nova-pro-v1:0`) and to assume the TVM role, and adds the execution role to the TVM role's trust policy. The execution role gets no AgentCore Memory permissions. It prints an `export AGENT_ARN=...` line. Copy it into your shell:
 
 ```bash
 export AGENT_ARN=<printed-arn>
@@ -263,7 +283,7 @@ Obtain a JWT for `tenant-001` (used for all `tenant-001` calls below):
 TOKEN_TENANT_1=$(aws cognito-idp initiate-auth \
   --auth-flow USER_PASSWORD_AUTH \
   --client-id $COGNITO_CLIENT_ID \
-  --auth-parameters USERNAME=tenant001@example.com,PASSWORD=$COGNITO_USER_PASSWORD \
+  --auth-parameters USERNAME=tenant001@example.com,PASSWORD="$COGNITO_USER_PASSWORD" \
   --query 'AuthenticationResult.IdToken' --output text)
 ```
 
@@ -335,7 +355,7 @@ Obtain a JWT for `tenant-002` and ask the same question. Tenant-002's `actor_id`
 TOKEN_TENANT_2=$(aws cognito-idp initiate-auth \
   --auth-flow USER_PASSWORD_AUTH \
   --client-id $COGNITO_CLIENT_ID \
-  --auth-parameters USERNAME=tenant002@example.com,PASSWORD=$COGNITO_USER_PASSWORD \
+  --auth-parameters USERNAME=tenant002@example.com,PASSWORD="$COGNITO_USER_PASSWORD" \
   --query 'AuthenticationResult.IdToken' --output text)
 
 curl -s -X POST "$LAB_AGENT_ENDPOINT" \
@@ -345,7 +365,21 @@ curl -s -X POST "$LAB_AGENT_ENDPOINT" \
   -d '{"message": "What is my favourite colour?", "conversation_id": "conv-001"}'
 ```
 
-> **Expected:** tenant-002 has no memory of any favourite colour - same agent, completely isolated memory per tenant. The control-plane denial is proven directly in step 7 (`prove_isolation.py`).
+> **Expected:** tenant-002 has no memory of any favourite colour - same agent, completely isolated memory per tenant. The IAM denial is proven directly in step 7 (`prove_isolation.py`).
+
+To check that a user cannot move to another tenant, try to change the attribute with tenant-002's access token. Cognito rejects it:
+
+```bash
+ACCESS_TENANT_2=$(aws cognito-idp initiate-auth \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id $COGNITO_CLIENT_ID \
+  --auth-parameters USERNAME=tenant002@example.com,PASSWORD="$COGNITO_USER_PASSWORD" \
+  --query 'AuthenticationResult.AccessToken' --output text)
+
+aws cognito-idp update-user-attributes \
+  --access-token "$ACCESS_TENANT_2" \
+  --user-attributes Name=custom:tenant_id,Value=tenant-001
+```
 
 > **`runtimeSessionId` length:** the `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` header must be 33-64 characters.
 
@@ -355,11 +389,23 @@ curl -s -X POST "$LAB_AGENT_ENDPOINT" \
 
 ## Clean up
 
-Tear down every AWS resource created by the setup scripts, plus local toolkit artifacts:
+Tear down the AWS resources created by the setup scripts, plus local toolkit artifacts:
 
 ```bash
 bash scripts/cleanup.sh
 ```
+
+The runtime is removed with the starter toolkit's destroy operation, which also removes what the toolkit created on deploy (execution role, CodeBuild project and role, ECR repository, S3 artifacts). The memory, the IAM roles and the user pool are deleted only if they carry the tag `sample=multi-tenant-agentcore-memory` that the setup scripts add; anything else with the same name is skipped and reported. Runtime log groups are kept.
+
+---
+
+## Known limitations
+
+- **The tenant id is trusted as it arrives.** IAM checks that every memory call matches the tenant in the session tag; it cannot tell whether that tenant is right. The sample relies on an immutable Cognito attribute in a JWT that AgentCore Runtime verifies.
+- **Isolation between users of one tenant is application-only.** The IAM conditions stop at the tenant prefix.
+- **Start-up writes a placeholder record.** Each fresh microVM writes one session record under the reserved actor `_bootstrap:assistant:init`. It holds no tenant data.
+- **A new session logs one SDK error.** For a session with no stored agent record the SDK also tries a legacy actor id (`agent_<id>`); IAM denies it by design, and the SDK logs `Failed to read agent` and carries on.
+- **SDK internals.** The session manager swaps the SDK's memory clients and mutates its config per request. The SDK versions are pinned; see [Requirements](#requirements).
 
 ---
 

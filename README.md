@@ -70,7 +70,7 @@ Available in single-tenant (one shared index) and multi-tenant (one index per te
 
 This sample provides a tenant-isolated Strands `SessionManager` that gives any Strands Agent persistent memory backed by [Amazon Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory.html). Multiple tenants share a single AgentCore Memory resource, and every memory operation is scoped to one tenant.
 
-Isolation is enforced at two independent layers: the application layer embeds `tenantId` in the `actor_id` and `session_id` identifiers, and the IAM control plane enforces it through ABAC conditions (`bedrock-agentcore:actorId` and `bedrock-agentcore:namespacePath`) on a per-tenant Token Vending Machine role. Even a buggy agent that constructs the wrong identifier is denied by AWS. Designed for deployment on Amazon Bedrock AgentCore Runtime.
+Isolation is enforced in two places: the application embeds `tenantId` in the `actor_id` and `session_id` identifiers, and IAM enforces it through ABAC conditions (`bedrock-agentcore:actorId` and `bedrock-agentcore:namespacePath`) on a shared Token Vending Machine role whose credentials sign every memory call. Code that builds the wrong identifier is denied by AWS; the tenant id itself comes from an immutable Cognito attribute. Designed for deployment on Amazon Bedrock AgentCore Runtime.
 
 [Multi-tenant AgentCore Memory for Strands Agents](./samples/multi-tenant-agentcore-memory/)
 

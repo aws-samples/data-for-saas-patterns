@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
 # setup_tvm_role.sh — Creates the AgentCore Memory TVM IAM role
 # Usage: bash setup_tvm_role.sh <memory-arn>
 #
@@ -9,7 +12,9 @@ set -euo pipefail
 MEMORY_ARN="${1:?Usage: bash setup_tvm_role.sh <memory-arn>}"
 ROLE_NAME="agentcore-memory-tvm-role"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+CALLER_ARN=$(aws sts get-caller-identity --query Arn --output text)
 REGION="${AWS_REGION:-us-east-1}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "→ Account : $ACCOUNT_ID"
 echo "→ Region  : $REGION"
@@ -18,27 +23,13 @@ echo "→ Role    : $ROLE_NAME"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Trust policy — allows the current account and the AgentCore service to
-# assume + tag the role.
+# Trust policy — the role trusts only named principals, and only when they set
+# exactly one session tag, TenantID. This script adds the identity running it
+# (so you can run examples/prove_isolation.py); setup_agentcore.sh adds the
+# AgentCore Runtime execution role. Nobody else in the account can assume it.
 # ---------------------------------------------------------------------------
-TRUST_POLICY=$(cat <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": { "AWS": "arn:aws:iam::${ACCOUNT_ID}:root" },
-      "Action": ["sts:AssumeRole", "sts:TagSession"]
-    },
-    {
-      "Effect": "Allow",
-      "Principal": { "Service": "bedrock-agentcore.amazonaws.com" },
-      "Action": ["sts:AssumeRole", "sts:TagSession"]
-    }
-  ]
-}
-EOF
-)
+echo "→ Creating or updating role and trust policy (trusting $CALLER_ARN) ..."
+ROLE_ARN=$(python3 "$SCRIPT_DIR/tvm_trust.py" "$ROLE_NAME" "$CALLER_ARN")
 
 # ---------------------------------------------------------------------------
 # Memory policy — scoped to the TenantID session tag via ABAC conditions.
@@ -46,6 +37,9 @@ EOF
 # namespacePath condition restricts long-term memory retrieval (LTM). A session
 # tagged TenantID=tenant-002 can therefore never touch an actorId starting with
 # "tenant-001:" nor retrieve records under tenant-001's namespaces.
+#
+# DeleteEvent is included so the SDK's message redaction works; it carries the
+# same actorId condition.
 #
 # IMPORTANT: LTM retrieval must condition on bedrock-agentcore:namespacePath
 # (prefix retrieval), NOT bedrock-agentcore:namespace. The SDK's
@@ -63,7 +57,8 @@ MEMORY_POLICY=$(cat <<EOF
       "Action": [
         "bedrock-agentcore:CreateEvent",
         "bedrock-agentcore:GetEvent",
-        "bedrock-agentcore:ListEvents"
+        "bedrock-agentcore:ListEvents",
+        "bedrock-agentcore:DeleteEvent"
       ],
       "Resource": "${MEMORY_ARN}",
       "Condition": {
@@ -90,30 +85,11 @@ MEMORY_POLICY=$(cat <<EOF
 EOF
 )
 
-# ---------------------------------------------------------------------------
-# Create or update the role
-# ---------------------------------------------------------------------------
-if aws iam get-role --role-name "$ROLE_NAME" &>/dev/null; then
-  echo "→ Role already exists — updating trust policy ..."
-  aws iam update-assume-role-policy \
-    --role-name "$ROLE_NAME" \
-    --policy-document "$TRUST_POLICY"
-else
-  echo "→ Creating role $ROLE_NAME ..."
-  aws iam create-role \
-    --role-name "$ROLE_NAME" \
-    --assume-role-policy-document "$TRUST_POLICY" \
-    --description "TVM role for AgentCore Memory tenant isolation" \
-    > /dev/null
-fi
-
 echo "→ Attaching memory policy ..."
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "AgentCoreMemoryTenantPolicy" \
   --policy-document "$MEMORY_POLICY"
-
-ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query Role.Arn --output text)
 
 echo ""
 echo "✓ Done. Set these environment variables before running the demo:"

@@ -1,3 +1,5 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """
 test_token_vending_machine.py — Unit tests for TokenVendingMachine.
 
@@ -9,13 +11,18 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from agentcore_memory.token_vending_machine import TokenVendingMachine, IsolationError
+from agentcore_memory.token_vending_machine import (
+    BOOTSTRAP_TENANT_ID,
+    IsolationError,
+    TokenVendingMachine,
+    validate_tenant_id,
+)
 
 VALID_ARN = "arn:aws:iam::123:role/R"
 
 STS_CREDENTIALS = {
     "AccessKeyId": "AKIA_TEST",
-    "SecretAccessKey": "secret",
+    "SecretAccessKey": "secret",  # pragma: allowlist secret — test fixture, not a credential
     "SessionToken": "token",
 }
 
@@ -115,15 +122,76 @@ class TestTVMGetSession:
 
 
 class TestTVMNegativeCache:
-    def test_sts_failure_cached_prevents_second_call(self):
+    def _failing_tvm(self, mock_boto_client):
+        mock_sts = MagicMock()
+        mock_sts.assume_role.side_effect = RuntimeError("STS throttled")
+        mock_boto_client.return_value = mock_sts
+        return TokenVendingMachine(role_arn=VALID_ARN), mock_sts
+
+    def test_sts_failure_backs_off_briefly(self):
         with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
              patch("agentcore_memory.token_vending_machine.boto3.Session"):
-            mock_sts = MagicMock()
-            mock_sts.assume_role.side_effect = RuntimeError("STS throttled")
+            tvm, mock_sts = self._failing_tvm(mock_boto_client)
+            with pytest.raises(IsolationError):
+                tvm.get_session({"tenantId": "tenant-001"})
+            with pytest.raises(IsolationError, match="recently failed"):
+                tvm.get_session({"tenantId": "tenant-001"})
+            assert mock_sts.assume_role.call_count == 1
+
+    def test_sts_failure_is_retried_after_back_off(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
+             patch("agentcore_memory.token_vending_machine.boto3.Session"), \
+             patch("agentcore_memory.token_vending_machine.time.monotonic") as clock:
+            tvm, mock_sts = self._failing_tvm(mock_boto_client)
+            clock.return_value = 1000.0
+            with pytest.raises(IsolationError):
+                tvm.get_session({"tenantId": "tenant-001"})
+            # Back-off is seconds, not the 12-minute credential TTL.
+            clock.return_value = 1006.0
+            mock_sts.assume_role.side_effect = None
+            mock_sts.assume_role.return_value = {"Credentials": STS_CREDENTIALS}
+            tvm.get_session({"tenantId": "tenant-001"})
+            assert mock_sts.assume_role.call_count == 2
+
+
+class TestTenantIdValidation:
+    @pytest.mark.parametrize("good", ["tenant-001", "acme", "A_b-9", "a" * 57])
+    def test_valid_tenant_ids_accepted(self, good):
+        assert validate_tenant_id({"tenantId": good}) == good
+
+    @pytest.mark.parametrize("bad", [
+        "acme:corp",   # ':' is the actorId separator
+        "acme/x",      # '/' is the namespace separator
+        "-leading",
+        "_bootstrap",  # reserved for the start-up placeholder
+        "a" * 58,      # RoleSessionName limit
+        "tenant 1",
+        123,
+    ])
+    def test_invalid_tenant_ids_rejected(self, bad):
+        with pytest.raises(IsolationError):
+            validate_tenant_id({"tenantId": bad})
+
+    def test_get_session_rejects_invalid_tenant_before_sts(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client:
+            mock_sts = _make_sts_mock()
             mock_boto_client.return_value = mock_sts
             tvm = TokenVendingMachine(role_arn=VALID_ARN)
             with pytest.raises(IsolationError):
-                tvm.get_session({"tenantId": "tenant-001"})
-            with pytest.raises(IsolationError):
-                tvm.get_session({"tenantId": "tenant-001"})
-            assert mock_sts.assume_role.call_count == 1
+                tvm.get_session({"tenantId": "acme:corp"})
+            mock_sts.assume_role.assert_not_called()
+
+
+class TestBootstrapSession:
+    def test_bootstrap_session_uses_reserved_tag(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
+             patch("agentcore_memory.token_vending_machine.boto3.Session"):
+            mock_sts = _make_sts_mock()
+            mock_boto_client.return_value = mock_sts
+            TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session()
+            mock_sts.assume_role.assert_called_once_with(
+                RoleArn=VALID_ARN,
+                RoleSessionName=f"tenant-{BOOTSTRAP_TENANT_ID}",
+                Tags=[{"Key": "TenantID", "Value": BOOTSTRAP_TENANT_ID}],
+                DurationSeconds=900,
+            )

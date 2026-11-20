@@ -1,13 +1,19 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
 """
 multi_tenant_agent.py — Multi-tenant agent with tenant-isolated Bedrock
 AgentCore Memory, deployed on Amazon Bedrock AgentCore Runtime.
 
-Multiple tenants share a single AgentCore Memory resource, but isolation is
-enforced at two independent layers:
+Multiple tenants share a single AgentCore Memory resource. Isolation is
+enforced in two places:
   Application : actor_id embeds tenantId
-  IAM         : the TVM role condition
-                bedrock-agentcore:actorId = "${aws:PrincipalTag/TenantID}:*"
-                enforces it at the AWS control plane
+  IAM         : memory calls are signed with TVM credentials, and the TVM role
+                condition bedrock-agentcore:actorId = "${aws:PrincipalTag/TenantID}:*"
+                makes AWS deny any other tenant's actor
+
+Both take the tenant from the same JWT claim, so the claim must be one the user
+cannot change: setup_cognito.sh creates custom:tenant_id as an immutable
+attribute that the app client cannot write.
 
 The MultiTenantAgentCoreMemorySessionManager registers a BeforeInvocationEvent
 hook that reads tenant identity from invocation_state and updates the config and
@@ -22,7 +28,8 @@ HTTP contract (required by AgentCore Runtime):
 
 Env vars: AGENTCORE_MEMORY_ID, AGENTCORE_TVM_ROLE_ARN, AWS_REGION, BEDROCK_MODEL_ID
 
-Local test:
+Local test (NOT for anything but your own machine: run locally, nothing
+verifies the JWT, so any hand-made token picks any tenant):
   pip install -e ".[agentcore]"
   AGENTCORE_MEMORY_ID=... AGENTCORE_TVM_ROLE_ARN=... \
     python3 examples/multi_tenant_agent.py
@@ -94,17 +101,19 @@ def _decode_jwt_payload(token: str) -> dict:
 
 def _extract_identity(context) -> dict | None:
     """
-    Extract and validate tenant identity from the AgentCore request context.
+    Extract tenant identity from the AgentCore request context.
 
     Returns a dict with tenant_context + user_id, or None if the JWT is missing
-    or the tenant_id claim is absent. user_id is always taken from the JWT `sub`
-    claim — never overridable by the request payload.
+    or the tenant_id or sub claim is absent. user_id is always taken from the
+    JWT `sub` claim — never overridable by the request payload. The tenant id
+    format is validated by the session manager.
     """
     headers     = context.request_headers or {}
     auth_header = headers.get("Authorization") or headers.get("authorization") or ""
     claims      = _decode_jwt_payload(auth_header.removeprefix("Bearer "))
     tenant_id   = claims.get("custom:tenant_id", "")
-    if not tenant_id:
+    user_id     = claims.get("sub", "")
+    if not tenant_id or not user_id:
         return None
     return {
         "tenant_context": {
@@ -112,7 +121,7 @@ def _extract_identity(context) -> dict | None:
             "tenantName": claims.get("custom:tenant_name", ""),
             "tier":       claims.get("custom:tier", "standard"),
         },
-        "user_id": claims.get("sub", "unknown"),
+        "user_id": user_id,
     }
 
 
@@ -122,7 +131,7 @@ def invoke(payload: dict, context) -> dict:
     try:
         identity = _extract_identity(context)
         if not identity:
-            return {"error": "JWT missing custom:tenant_id claim"}
+            return {"error": "JWT missing custom:tenant_id or sub claim"}
 
         tenant_id       = identity["tenant_context"]["tenantId"]
         conversation_id = payload.get("conversation_id") or context.session_id or "default"
@@ -137,10 +146,11 @@ def invoke(payload: dict, context) -> dict:
         )
         response_str = str(response)
 
+        # Log identifiers and sizes only — never conversation content.
         logger.info(
-            "[request] tenant=%s conv=%s user=%s\n  USER : %s\n  AGENT: %s",
+            "[request] tenant=%s conv=%s user=%s message_chars=%d response_chars=%d",
             tenant_id, conversation_id, identity["user_id"],
-            message[:200], response_str[:200],
+            len(message), len(response_str),
         )
 
         return {
@@ -149,13 +159,11 @@ def invoke(payload: dict, context) -> dict:
             "conversation_id": conversation_id,
         }
     except Exception as e:
-        import traceback
         # Full details go to server-side logs only. Exception messages can
         # contain internal identifiers (role ARNs, tenant ids, etc. — see
         # IsolationError in token_vending_machine.py), so the HTTP response
         # returns a generic error rather than str(e).
-        logger.error("invoke error: %s: %s", type(e).__name__, e)
-        logger.error(traceback.format_exc())
+        logger.exception("invoke error: %s", type(e).__name__)
         return {"error": "internal error processing request"}
 
 
