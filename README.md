@@ -9,6 +9,7 @@ This repository contains a collection of samples, best practices and reference a
 * * [RDS Data API Row-level Security](README.md#rds-data-api-row-level-security)
 * * [Multi-tenant vector databases](README.md#multi-tenant-vector-databases)
 * * [Multi-tenant S3 Vectors long-term memory for Strands Agents](README.md#multi-tenant-s3-vectors-long-term-memory-for-strands-agents)
+* * [Multi-tenant AgentCore Memory for Strands Agents](README.md#multi-tenant-agentcore-memory-for-strands-agents)
 * * [Multi-tenant AI Agent with BigQuery Row-Level Security](README.md#multi-tenant-ai-agent-with-bigquery-row-level-security)
 * * [Multi-tenant AI Agent with Databricks Row-Level Security](README.md#multi-tenant-ai-agent-with-databricks-row-level-security)
 * * [Scheduled Autoscaling Aurora Serverless V2](README.md#scheduled-autoscaling-aurora-serverless-v2)
@@ -64,6 +65,14 @@ This sample provides a [Strands Plugin](https://strandsagents.com/docs/user-guid
 Available in single-tenant (one shared index) and multi-tenant (one index per tenant with IAM ABAC isolation via a Token Vending Machine) modes. Designed for deployment on Amazon Bedrock AgentCore Runtime.
 
 [S3 Vector Memory Plugin for Strands Agents](./samples/multi-tenant-strands-s3-vectors-memory/)
+
+## Multi-tenant AgentCore Memory for Strands Agents
+
+This sample provides a tenant-isolated Strands `SessionManager` that gives any Strands Agent persistent memory backed by [Amazon Bedrock AgentCore Memory](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/memory.html). Multiple tenants share a single AgentCore Memory resource, and every memory operation is scoped to one tenant.
+
+Isolation is enforced in two places: the application embeds `tenantId` in the `actor_id` and `session_id` identifiers, and IAM enforces it through ABAC conditions (`bedrock-agentcore:actorId` and `bedrock-agentcore:namespacePath`) on a shared Token Vending Machine role whose credentials sign every memory call. Code that builds the wrong identifier is denied by AWS; the tenant id itself comes from an immutable Cognito attribute. Designed for deployment on Amazon Bedrock AgentCore Runtime.
+
+[Multi-tenant AgentCore Memory for Strands Agents](./samples/multi-tenant-agentcore-memory/)
 
 ## Multi-tenant AI Agent with BigQuery Row-Level Security
 
