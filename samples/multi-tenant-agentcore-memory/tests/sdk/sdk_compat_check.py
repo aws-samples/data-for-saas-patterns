@@ -50,7 +50,6 @@ from agentcore_memory import (  # noqa: E402
     TokenVendingMachine,
 )
 
-memory_clients = []   # (tenant tag or None, service name)
 denied = []           # (tag, actor) pairs IAM would have refused
 store = {}            # (actor, session) -> {"agent": [events], "messages": [events]}
 failing_record_reads = set()    # actors whose agent-record read is throttled
@@ -72,7 +71,6 @@ def fake_client(self, service_name, *args, **kwargs):
     tag = getattr(self, "_tvm_tag", None)
     client._tvm_tag = tag
     if service_name.startswith("bedrock-agentcore"):
-        memory_clients.append((tag, service_name))
 
         def create_event(**kw):
             memory_calls.append((tag, "CreateEvent"))
@@ -219,8 +217,8 @@ with patch.object(boto3.session.Session, "client", fake_client), \
 
     if BOOTSTRAP_TENANT_ID in assumed_tags:
         problems.append("start-up assumed the TVM role")
-    if memory_calls[:1] and memory_calls[0][0] is None:
-        problems.append("a memory call ran before the first request's TVM swap")
+    if any(tag is None for tag, _ in memory_calls):
+        problems.append("a memory call ran without a TVM session")
     if denied:
         problems.append(f"calls IAM would deny: {denied}")
     for name in ("_held_records", "_latest_agent_message", "_last_synced_internal_state",
