@@ -10,18 +10,17 @@ for AgentCore Memory, so stored state and history are really restored.
 
 It checks that:
   * the session manager can be constructed, twice (a second boot);
-  * every AgentCore Memory client is built from a TVM session, never from the
-    container's default credentials;
+  * start-up makes no AgentCore Memory call and does not assume the TVM role
+    (AgentCore Runtime SnapStart runs it at build time), and every memory call
+    is made with a TVM session, never the container's credentials;
   * no SDK call touches an actor outside its session's tenant;
   * a request through the real BeforeInvocationEvent hook restores the stored
     agent state and transcript of its own session;
   * agent state and transcript from tenant A do not reach tenant B;
   * a failed agent-record read, a failed history read and a corrupt history
     event each fail the request and unbind the agent;
-  * a second boot uses the state the code builds, not the first boot's
-    placeholder (with the default conversation manager this needs both the
-    placeholder guard and the snapshot order to regress; the unit tests cover
-    each one alone);
+  * a second boot uses the state the code builds, not a placeholder record an
+    older deploy left behind;
   * the SDK internals the session manager relies on still exist.
 
 Run by tests/sdk/test_sdk_compat.py in a separate process, so the stubs in
@@ -55,6 +54,8 @@ memory_clients = []   # (tenant tag or None, service name)
 denied = []           # (tag, actor) pairs IAM would have refused
 store = {}            # (actor, session) -> {"agent": [events], "messages": [events]}
 failing_record_reads = set()    # actors whose agent-record read is throttled
+assumed_tags = []               # TenantID tags the TVM was asked for
+memory_calls = []               # (tag, operation) for every AgentCore Memory call
 failing_history_reads = set()   # actors whose transcript read is throttled
 
 
@@ -74,6 +75,7 @@ def fake_client(self, service_name, *args, **kwargs):
         memory_clients.append((tag, service_name))
 
         def create_event(**kw):
+            memory_calls.append((tag, "CreateEvent"))
             if not _allowed(tag, kw.get("actorId")):
                 denied.append((tag, kw.get("actorId")))
                 raise _deny("CreateEvent")
@@ -89,6 +91,7 @@ def fake_client(self, service_name, *args, **kwargs):
 
 def fake_list_events(self, memory_id, actor_id, session_id, event_metadata=None, **kwargs):
     tag = getattr(self.gmdp_client, "_tvm_tag", None)
+    memory_calls.append((tag, "ListEvents"))
     if not _allowed(tag, actor_id):
         denied.append((tag, actor_id))
         raise _deny("ListEvents")
@@ -104,6 +107,7 @@ def fake_list_events(self, memory_id, actor_id, session_id, event_metadata=None,
 
 
 def fake_assume(self, tenant_id):
+    assumed_tags.append(tenant_id)
     session = boto3.Session(region_name="us-east-1")
     session._tvm_tag = tenant_id
     return session
@@ -193,23 +197,30 @@ with patch.object(boto3.session.Session, "client", fake_client), \
     ]
     expect_unbound("a corrupt history event", "tenant-006")
 
-    if not store.get((f"{BOOTSTRAP_TENANT_ID}:{AGENT_NAME}:init", f"{BOOTSTRAP_TENANT_ID}-{AGENT_NAME}-init")):
-        problems.append("first boot did not write the placeholder record the second boot must ignore")
+    if store.get((f"{BOOTSTRAP_TENANT_ID}:{AGENT_NAME}:init", f"{BOOTSTRAP_TENANT_ID}-{AGENT_NAME}-init")):
+        problems.append("start-up wrote a placeholder record")
 
+    # An older deploy of the sample did write a placeholder; a new boot must ignore it.
+    seed(BOOTSTRAP_TENANT_ID, AGENT_NAME, "init", {"v": 1}, "old placeholder")
+    store[(f"{BOOTSTRAP_TENANT_ID}:{AGENT_NAME}:init", f"{BOOTSTRAP_TENANT_ID}-{AGENT_NAME}-init")] = \
+        store.pop((f"{BOOTSTRAP_TENANT_ID}:{AGENT_NAME}:{AGENT_NAME}",
+                   f"{BOOTSTRAP_TENANT_ID}-{AGENT_NAME}-{AGENT_NAME}-init"))
+    calls_before_boot2 = len(memory_calls)
     try:
         mgr2, agent2 = build({"v": 2})
     except Exception as e:
         problems.append(f"second boot failed: {type(e).__name__}: {e}")
     else:
+        if len(memory_calls) != calls_before_boot2:
+            problems.append(f"start-up made AgentCore Memory calls: {memory_calls[calls_before_boot2:]}")
         invoke_hook(agent2, "tenant-004", "user-1", "conv-1")
         if agent2.state.get("v") != 2:
             problems.append(f"second boot used an earlier boot's state: {agent2.state.get()}")
 
-    untagged = [svc for tag, svc in memory_clients if tag is None]
-    if untagged:
-        problems.append(f"memory clients built from default credentials: {untagged}")
-    if not any(tag == BOOTSTRAP_TENANT_ID for tag, _ in memory_clients):
-        problems.append("start-up placeholder did not use the bootstrap TVM session")
+    if BOOTSTRAP_TENANT_ID in assumed_tags:
+        problems.append("start-up assumed the TVM role")
+    if memory_calls[:1] and memory_calls[0][0] is None:
+        problems.append("a memory call ran before the first request's TVM swap")
     if denied:
         problems.append(f"calls IAM would deny: {denied}")
     for name in ("_held_records", "_latest_agent_message", "_last_synced_internal_state",

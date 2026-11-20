@@ -10,6 +10,7 @@ lightweight stub modules into sys.modules before those imports run.
 src/ and examples/ are on sys.path via pyproject.toml [tool.pytest.ini_options].
 """
 
+import enum
 import os
 import sys
 import types
@@ -110,13 +111,18 @@ def _install_bedrock_agentcore_stub():
             self.top_k = top_k
             self.relevance_score = relevance_score
 
+    class PersistenceMode(str, enum.Enum):
+        FULL = "FULL"
+        NONE = "NONE"
+
     class AgentCoreMemoryConfig:
         def __init__(self, memory_id=None, actor_id=None, session_id=None,
-                     retrieval_config=None, **kwargs):
+                     retrieval_config=None, persistence_mode=PersistenceMode.FULL, **kwargs):
             self.memory_id        = memory_id
             self.actor_id         = actor_id
             self.session_id       = session_id
             self.retrieval_config = retrieval_config
+            self.persistence_mode = persistence_mode
 
     class AgentCoreMemorySessionManager:
         """Minimal stand-in for the real base class."""
@@ -126,6 +132,7 @@ def _install_bedrock_agentcore_stub():
             self.config         = agentcore_memory_config
             self.region_name    = region_name
             self.boto_session   = boto_session
+            self.persistence_mode = getattr(agentcore_memory_config, "persistence_mode", None)
             self.session_id     = getattr(agentcore_memory_config, "session_id", None)
             self.memory_client  = MagicMock()
             self.converter      = MagicMock()
@@ -155,6 +162,7 @@ def _install_bedrock_agentcore_stub():
             return []
 
     config.RetrievalConfig = RetrievalConfig
+    config.PersistenceMode = PersistenceMode
     sm.AgentCoreMemoryConfig = AgentCoreMemoryConfig
     sm.AgentCoreMemorySessionManager = AgentCoreMemorySessionManager
 

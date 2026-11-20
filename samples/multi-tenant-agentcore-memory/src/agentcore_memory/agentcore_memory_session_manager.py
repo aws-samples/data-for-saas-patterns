@@ -56,11 +56,14 @@ AgentCore Memory identifiers:
              not `namespace` — conditioning on `namespace` silently returns zero
              records.
 
-Start-up placeholder: the base SDK writes an initial session when the Agent is
-constructed, before any tenant is known. That placeholder runs under TVM
-credentials tagged with the reserved BOOTSTRAP_TENANT_ID, so the container's own
-role needs no AgentCore Memory permissions at all. It is never read back, so
-every start-up begins from the state the code builds.
+Start-up: the base SDK sets up an initial session when the Agent is
+constructed, before any tenant is known. Here that start-up makes no AWS calls:
+the placeholder session (under the reserved BOOTSTRAP_TENANT_ID) is never read,
+nothing is written until the agent is initialised, and the clients hold inert
+credentials until the first request swaps in TVM clients. The container's own
+role needs no AgentCore Memory permissions, every boot begins from the state the
+code builds, and AgentCore Runtime SnapStart (which runs module code at build
+time) needs no AWS access.
 
 Legacy lookups: when a record is missing, the SDK also looks for it under a
 legacy actor id ("session_<id>" / "agent_<id>") that no tenant owns. This class
@@ -83,11 +86,13 @@ import os
 import re
 from typing import Dict, Optional
 
+import boto3
+
 from strands.agent.state import AgentState
 from strands.hooks import BeforeInvocationEvent
 from strands.hooks.registry import HookRegistry
 from strands.types.session import SessionAgent
-from bedrock_agentcore.memory.integrations.strands.config import RetrievalConfig
+from bedrock_agentcore.memory.integrations.strands.config import PersistenceMode, RetrievalConfig
 from bedrock_agentcore.memory.integrations.strands.session_manager import (
     AgentCoreMemoryConfig,
     AgentCoreMemorySessionManager,
@@ -190,8 +195,12 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         }
 
         # Placeholder config — actor_id/session_id are overwritten per request in
-        # _prepare(). The placeholder lives under the reserved bootstrap tenant
-        # and runs under bootstrap TVM credentials, never the container's own.
+        # _prepare(). Start-up makes no AWS calls at all: the placeholder is
+        # never read (see read_session/read_agent), persistence is off until the
+        # agent is initialised, and the clients carry inert credentials that AWS
+        # would reject, so nothing can reach AgentCore Memory before the first
+        # request swaps in TVM clients. This also keeps start-up safe for
+        # AgentCore Runtime SnapStart, which runs module code at build time.
         self._placeholder_actor   = f"{BOOTSTRAP_TENANT_ID}:{agent_name}:init"
         self._placeholder_session = f"{BOOTSTRAP_TENANT_ID}-{agent_name}-init"
         placeholder = AgentCoreMemoryConfig(
@@ -199,11 +208,17 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
             actor_id=self._placeholder_actor,
             session_id=self._placeholder_session,
             retrieval_config=self._retrieval_config,
+            persistence_mode=PersistenceMode.NONE,
+        )
+        inert_session = boto3.Session(
+            aws_access_key_id="inert-placeholder",          # pragma: allowlist secret — not a credential
+            aws_secret_access_key="inert-placeholder",      # pragma: allowlist secret — not a credential
+            region_name=self.region_name,
         )
         super().__init__(
             agentcore_memory_config=placeholder,
             region_name=self.region_name,
-            boto_session=self._tvm.get_bootstrap_session(),
+            boto_session=inert_session,
             **kwargs,
         )
         # Reuse the base client config (user agent, retries) on every client swap.
@@ -329,9 +344,15 @@ class MultiTenantAgentCoreMemorySessionManager(AgentCoreMemorySessionManager):
         return messages
 
     def initialize(self, agent, **kwargs) -> None:
-        """Keep a clean copy of the agent's state as built by the code, then run the base start-up."""
+        """
+        Keep a clean copy of the agent's state as built by the code, run the base
+        start-up (no AWS calls: the placeholder is unread and persistence is
+        off), then turn persistence on for real requests.
+        """
         self._clean_agent[agent.agent_id] = copy.deepcopy(SessionAgent.from_agent(agent))
         super().initialize(agent, **kwargs)
+        self.persistence_mode        = PersistenceMode.FULL
+        self.config.persistence_mode = PersistenceMode.FULL
 
     def register_hooks(self, registry: HookRegistry, **kwargs) -> None:
         """Register all AgentCore hooks plus the per-request tenant injection hook."""

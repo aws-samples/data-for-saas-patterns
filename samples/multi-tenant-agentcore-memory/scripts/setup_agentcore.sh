@@ -16,7 +16,8 @@
 #
 # Optional env vars:
 #   EXAMPLE_FILE             (default: multi_tenant_agent.py)
-#   AGENT_NAME               (default: multi_tenant_agentcore_memory_agent)
+#   AGENT_NAME               (default: mt_memory_agent; keep it short, the
+#                            toolkit's observability names must fit 60 characters)
 #   BEDROCK_MODEL_ID         (default: amazon.nova-pro-v1:0)
 #
 # Outputs:
@@ -31,7 +32,7 @@ export AWS_REGION="${AWS_REGION:-us-east-1}"
 
 export AGENTCORE_MEMORY_ID AGENTCORE_TVM_ROLE_ARN COGNITO_USER_POOL_ID COGNITO_CLIENT_ID
 export EXAMPLE_FILE="${EXAMPLE_FILE:-multi_tenant_agent.py}"
-export AGENT_NAME="${AGENT_NAME:-multi_tenant_agentcore_memory_agent}"
+export AGENT_NAME="${AGENT_NAME:-mt_memory_agent}"
 export BEDROCK_MODEL_ID="${BEDROCK_MODEL_ID:-amazon.nova-pro-v1:0}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export SCRIPT_DIR

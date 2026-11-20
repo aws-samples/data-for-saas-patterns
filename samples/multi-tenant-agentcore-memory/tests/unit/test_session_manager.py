@@ -93,13 +93,22 @@ class TestConstruction:
         assert mgr.agent_name == AGENT_NAME
         assert mgr.region_name == "us-east-1"
 
-    def test_placeholder_runs_under_bootstrap_tvm_session(self):
-        """Start-up memory calls never use the container's own credentials."""
+    def test_start_up_makes_no_tvm_call_and_uses_inert_credentials(self):
+        """Start-up never assumes the TVM role and never uses the container's credentials."""
         mgr = _make_manager()
-        mgr._tvm.get_bootstrap_session.assert_called_once_with()
-        assert mgr.boto_session is mgr._tvm.get_bootstrap_session.return_value
+        mgr._tvm.get_session.assert_not_called()
+        creds = mgr.boto_session.get_credentials()
+        assert creds.access_key == "inert-placeholder"
         assert mgr.config.actor_id.startswith(f"{BOOTSTRAP_TENANT_ID}:")
         assert mgr.config.session_id.startswith(f"{BOOTSTRAP_TENANT_ID}-")
+
+    def test_persistence_is_off_until_initialise(self):
+        from bedrock_agentcore.memory.integrations.strands.config import PersistenceMode
+        mgr = _make_manager()
+        assert mgr.config.persistence_mode is PersistenceMode.NONE
+        mgr.initialize(_make_agent())
+        assert mgr.config.persistence_mode is PersistenceMode.FULL
+        assert mgr.persistence_mode is PersistenceMode.FULL
 
     def test_retrieval_config_uses_tenant_scoped_namespaces(self):
         mgr = _make_manager()

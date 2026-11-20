@@ -58,7 +58,7 @@ Isolation is enforced in two places:
 
 All tenants share a single AgentCore Memory resource. Isolation and persistence are wired through a custom Strands `SessionManager` (`MultiTenantAgentCoreMemorySessionManager`) rather than in the agent's own logic:
 
-1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC. Before the first request, the SDK's start-up placeholder session runs under TVM credentials tagged with the reserved tenant `agentcore-bootstrap`, which the tenant id check refuses for real tenants. The SDK's lookups of legacy actor ids (`session_<id>`, `agent_<id>`), which no tenant owns, are skipped.
+1. **Per-request tenant binding.** The session manager registers a `BeforeInvocationEvent` hook that calls `_prepare()` on each invocation. It reads `tenant_context`, `user_id`, and `conversation_id` from `invocation_state`, rebuilds the tenant-scoped `actor_id`/`session_id`, sets `retrieval_config`, and swaps the memory client's boto3 clients to TVM credentials (STS AssumeRole + `TenantID` session tag) for that tenant - credentials are swapped **before** any read, so every memory call runs under IAM ABAC. Start-up makes no AWS calls: the SDK's placeholder session (under the reserved tenant `agentcore-bootstrap`, which the tenant id check refuses for real tenants) is never read or written, and its clients hold inert credentials until the first request swaps in TVM clients. That also keeps start-up working under AgentCore Runtime SnapStart, which runs module code at build time. The SDK's lookups of legacy actor ids (`session_<id>`, `agent_<id>`), which no tenant owns, are skipped.
 
 2. **Short-term memory (conversation history).** Every turn is written to AgentCore Memory as an event under the current `sessionId` via `CreateEvent`. `_prepare` detects when the `actor_id` or `session_id` changes and, on change, replaces everything the agent carries from the previous session: `agent.state`, the conversation manager's state and the model state are restored from the new session's stored agent record (or reset to the clean start-up state if it has none), and `agent.messages` is **rehydrated** from AgentCore Memory via `list_messages` (`ListEvents`). Nothing from tenant A's session is written into tenant B's. If any of those reads fails, the request fails and the agent is cleared and unbound, so the next request reads again rather than running on an empty or stale transcript. This matters because on AgentCore Runtime the `Agent` is a module-level singleton whose in-process `agent.messages` is only a *warm-microVM cache*: a "known" `runtimeSessionId` can land on a **fresh microVM** after idle (15 min) or max-lifetime (8 hr) termination, with an empty `agent.messages`. Reading STM back per session change is what makes short-term recall survive a microVM boundary. (Assigning `agent.messages` directly does not re-emit `MessageAddedEvent`, so restored history is not re-persisted.)
 
@@ -261,7 +261,7 @@ Expected output (the script exits non-zero if any check fails):
 
 ### 8. Deploy to AgentCore Runtime
 
-Ensure the prerequisite variables from the earlier steps are exported: `AGENTCORE_MEMORY_ID`, `AGENTCORE_TVM_ROLE_ARN`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`.
+Ensure the prerequisite variables from the earlier steps are exported: `AGENTCORE_MEMORY_ID`, `AGENTCORE_TVM_ROLE_ARN`, `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`. The model defaults to `amazon.nova-pro-v1:0`; in Regions where it is served only through a cross-Region inference profile, set that instead, for example `export BEDROCK_MODEL_ID=eu.amazon.nova-pro-v1:0` in `eu-central-1`.
 
 Run the deploy:
 
@@ -295,7 +295,7 @@ TOKEN_TENANT_1=$(aws cognito-idp initiate-auth \
 
 ### 9. Store a fact
 
-Store a fact in conversation `conv-001`. The agent acknowledges it and returns `"tenant_id": "tenant-001"`:
+Store a fact in conversation `conv-001`. The agent acknowledges it and returns `"tenant_id": "tenant-001"`. Right after a deploy the runtime may answer `An unexpected error occurred while processing the request.` for a minute or two while it finishes starting; wait and retry:
 
 ```bash
 curl -s -X POST "$LAB_AGENT_ENDPOINT" \
@@ -409,7 +409,7 @@ The runtime is removed with the starter toolkit's destroy operation, which also 
 
 - **The tenant id is trusted as it arrives.** IAM checks that every memory call matches the tenant in the session tag; it cannot tell whether that tenant is right. The sample relies on an immutable Cognito attribute in a JWT that AgentCore Runtime verifies.
 - **Isolation between users of one tenant is application-only.** The IAM conditions stop at the tenant prefix.
-- **Start-up writes a placeholder record.** Each start-up writes a session and agent record under the reserved actor `agentcore-bootstrap:assistant:init` and never reads it back, so a code change to the agent's initial state takes effect on the next boot. It holds no tenant data.
+- **Each boot starts from the code.** The SDK's start-up placeholder session is never stored or read, so a code change to the agent's initial state takes effect on the next boot.
 - **An unreadable very large message is skipped.** Messages too large for a conversational event are stored as blobs, and the SDK skips a blob it cannot read. That one message is missing from the restored transcript; any other unreadable history event fails the request.
 - **Changing the conversation manager breaks stored sessions.** The SDK refuses to restore a session saved with a different conversation-manager class. After such a change, a request that switches to an older session fails with an error. Start a new `conversation_id` for those users, delete that session's events with `DeleteEvent`, or recreate the memory.
 - **The execution role can invoke any Bedrock model.** The starter toolkit creates the runtime execution role with Bedrock invoke on all foundation models. To narrow it, create your own execution role and pass it to `configure_bedrock_agentcore` (`execution_role`) in `scripts/setup_agentcore.sh`.

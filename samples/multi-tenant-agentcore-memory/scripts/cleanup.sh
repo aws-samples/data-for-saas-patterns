@@ -19,7 +19,7 @@
 #
 # Resolves resources by their fixed names, so no env vars are required. You may
 # still override any of them:
-#   AGENT_NAME       (default: multi_tenant_agentcore_memory_agent)
+#   AGENT_NAME       (default: mt_memory_agent)
 #   MEMORY_NAME      (default: multi_tenant_agentcore_memory)
 #   TVM_ROLE_NAME    (default: agentcore-memory-tvm-role)
 #   COGNITO_POOL_NAME (default: agentcore-memory-user-pool)
@@ -30,7 +30,7 @@ set -uo pipefail
 
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 REGION="$AWS_REGION"
-export AGENT_NAME="${AGENT_NAME:-multi_tenant_agentcore_memory_agent}"
+export AGENT_NAME="${AGENT_NAME:-mt_memory_agent}"
 MEMORY_NAME="${MEMORY_NAME:-multi_tenant_agentcore_memory}"
 TVM_ROLE_NAME="${TVM_ROLE_NAME:-agentcore-memory-tvm-role}"
 MEMORY_EXEC_ROLE_NAME="${MEMORY_EXEC_ROLE_NAME:-agentcore-memory-exec-role}"

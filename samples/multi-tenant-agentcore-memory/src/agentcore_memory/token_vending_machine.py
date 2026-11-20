@@ -26,7 +26,6 @@ Debug logging:
 import logging
 import os
 import re
-import time
 from typing import Any, Dict
 
 import boto3
@@ -100,28 +99,6 @@ class TokenVendingMachine:
         Raises IsolationError if tenantId is missing or invalid, or STS fails.
         """
         return self._assume(validate_tenant_id(tenant_context))
-
-    def get_bootstrap_session(self, attempts: int = 3, delay_seconds: float = 1.0) -> boto3.Session:
-        """
-        Return a session tagged with the reserved BOOTSTRAP_TENANT_ID.
-
-        Used only for the session manager's start-up placeholder, so it never
-        touches AgentCore Memory with the container's own credentials. The
-        reserved tag can only reach actors starting with 'agentcore-bootstrap:',
-        which no real tenant can own.
-
-        Runs at container start, so it retries a few times with back-off to ride
-        out a throttle or IAM propagation right after deployment.
-        """
-        for attempt in range(1, attempts + 1):
-            try:
-                return self._assume(BOOTSTRAP_TENANT_ID)
-            except IsolationError:
-                if attempt == attempts:
-                    raise
-                self._recent_failures.pop(BOOTSTRAP_TENANT_ID, None)
-                time.sleep(delay_seconds * attempt)
-        raise IsolationError("unreachable")  # pragma: no cover
 
     def _assume(self, tenant_id: str) -> boto3.Session:
         session = self._cache.get(tenant_id)

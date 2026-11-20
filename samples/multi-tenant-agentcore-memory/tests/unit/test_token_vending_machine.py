@@ -186,38 +186,11 @@ class TestTenantIdValidation:
                 tvm.get_session({"tenantId": "acme:corp"})
             mock_sts.assume_role.assert_not_called()
 
-
-class TestBootstrapSession:
-    def test_bootstrap_session_uses_reserved_tag(self):
-        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
-             patch("agentcore_memory.token_vending_machine.boto3.Session"):
+    def test_reserved_placeholder_tenant_is_rejected_before_sts(self):
+        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client:
             mock_sts = _make_sts_mock()
             mock_boto_client.return_value = mock_sts
-            TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session()
-            mock_sts.assume_role.assert_called_once_with(
-                RoleArn=VALID_ARN,
-                RoleSessionName=f"tenant-{BOOTSTRAP_TENANT_ID}",
-                Tags=[{"Key": "TenantID", "Value": BOOTSTRAP_TENANT_ID}],
-                DurationSeconds=900,
-            )
-
-    def test_bootstrap_session_retries_then_succeeds(self):
-        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
-             patch("agentcore_memory.token_vending_machine.boto3.Session"), \
-             patch("agentcore_memory.token_vending_machine.time.sleep") as sleep:
-            mock_sts = MagicMock()
-            mock_sts.assume_role.side_effect = [RuntimeError("propagating"), {"Credentials": STS_CREDENTIALS}]
-            mock_boto_client.return_value = mock_sts
-            TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session()
-            assert mock_sts.assume_role.call_count == 2
-            sleep.assert_called_once()
-
-    def test_bootstrap_session_gives_up_after_attempts(self):
-        with patch("agentcore_memory.token_vending_machine.boto3.client") as mock_boto_client, \
-             patch("agentcore_memory.token_vending_machine.time.sleep"):
-            mock_sts = MagicMock()
-            mock_sts.assume_role.side_effect = RuntimeError("denied")
-            mock_boto_client.return_value = mock_sts
-            with pytest.raises(IsolationError):
-                TokenVendingMachine(role_arn=VALID_ARN).get_bootstrap_session(attempts=3)
-            assert mock_sts.assume_role.call_count == 3
+            tvm = TokenVendingMachine(role_arn=VALID_ARN)
+            with pytest.raises(IsolationError, match="reserved"):
+                tvm.get_session({"tenantId": BOOTSTRAP_TENANT_ID})
+            mock_sts.assume_role.assert_not_called()
